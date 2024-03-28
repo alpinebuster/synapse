@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG SYNAPSE_VERSION=latest
-ARG FROM=matrixdotorg/synapse:$SYNAPSE_VERSION
+ARG FROM=zzz/synapse:$SYNAPSE_VERSION
 
 # first of all, we create a base image with an nginx which we can copy into the
 # target image. For repeated rebuilds, this is much faster than apt installing

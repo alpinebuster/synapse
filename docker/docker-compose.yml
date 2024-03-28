@@ -1,0 +1,134 @@
+# This compose file is compatible with Compose itself, it might need some
+# adjustments to run properly with stack.
+# 
+
+version: '3.8'
+
+networks:
+  net:
+    external: false
+
+services:
+  synapse_base_image_builder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: zzz/synapse:latest
+    pull_policy: never
+    container_name: synapse_base_image_builder
+    # Overriding its command with an echo, it will simply exit immediately.
+    command: [ "echo", "\"Build zzz/synapse:latest finished, EXIT\"" ]
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  synapse:
+    build:
+      context: ..
+      # `Dockerfile-workers` depends on the `zzz/synapse:latest` base image. 
+      dockerfile: docker/Dockerfile-workers
+    image: zzz/synapse-workers:latest
+    pull_policy: never
+    container_name: synapse
+    # Since synapse does not retry to connect to the database, restart upon
+    # failure
+    restart: unless-stopped
+    networks:
+      - net
+    # See the readme for a full documentation of the environment settings
+    # NOTE: You must edit homeserver.yaml to use postgres, it defaults to sqlite
+    environment:
+      - CHAT_SERVER_NAME=localhost
+      - CHAT_REPORT_STATS=no 
+      - POSTGRES_HOST=db
+      - POSTGRES_USER=zzz 
+      - POSTGRES_PASSWORD=123123 
+      - POSTGRES_CP_MAX=1000 # TODO:
+      # Note that if running multiple media repositories they must be on the same server
+      # and you must specify a single instance to run the background tasks in the
+      # [shared configuration](usage/configuration/config_documentation.md#media_instance_running_background_jobs),
+      # e.g.:
+      # ```yaml
+      # media_instance_running_background_jobs: "media-repository-1"
+      # ```
+      # 
+      # FIXME: 
+      # 1) media_repository worker not functional; 
+      # 2) stream_writers=account_data+presence+typing is buggy, 
+      #    see `RoomTypingRestServlet._is_typing_writer` for more details.
+      - CHAT_WORKER_TYPES=media_repository,pusher:2,client_reader:2,user_dir:2,appservice:2,federation_sender:2,synchrotron:2,federation_reader:2,federation_inbound:2,event_persister:2,event_creator:3,frontend_proxy:2,background_worker,stream_writers=account_data+presence+typing+receipts+to_device
+      - CHAT_WORKERS_WRITE_LOGS_TO_DISK=1
+    volumes:
+      - /home/data/synapse/data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - synapse_base_image_builder
+      - db
+    # In order to expose Chat, remove one of the following, you might for
+    # instance expose the TLS port directly:
+    ports:
+      - "8081:8080"
+
+  element_web:
+    container_name: element_web
+    image: vectorim/element-web:latest
+    restart: unless-stopped
+    ports:
+      - "8082:80"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+  
+  hydrogen_web:
+    container_name: hydrogen_web
+    build:
+      # /home/data/workspaces/hydrogen-web/Dockerfile
+      context: ../../hydrogen-web
+      dockerfile: Dockerfile
+    image: vectorim/hydrogen-web:latest
+    restart: unless-stopped
+    ports:
+      - "8083:80"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  pgadmin:
+    container_name: pgadmin
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      PGADMIN_DEFAULT_EMAIL: imzqqq@hotmail.com
+      PGADMIN_DEFAULT_PASSWORD: itsalsoasecret
+      # PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+      - /home/data/pgadmin:/var/lib/pgadmin
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "5050:80"
+    networks:
+      - net
+
+  db:
+    image: docker.io/postgres:14
+    container_name: synapse-db
+    restart: always
+    networks:
+      - net
+    # Change that password, of course!
+    environment:
+      - POSTGRES_USER=zzz
+      - POSTGRES_PASSWORD=123123
+      - POSTGRES_DB=synapse
+      # Ensure the database gets created correctly
+      # https://element-hq.github.io/synapse/latest/postgres.html#set-up-database
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - /home/data/synapse/psql:/var/lib/postgresql/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    command: postgres -c 'max_connections=1000' -c 'shared_buffers=3GB'
