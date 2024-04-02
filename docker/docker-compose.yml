@@ -2,11 +2,12 @@
 # adjustments to run properly with stack.
 # 
 
-version: '3.8'
+version: '3.9'
 
 networks:
   net:
     external: false
+  lkbackend:
 
 services:
   synapse_base_image_builder:
@@ -52,7 +53,7 @@ services:
       # media_instance_running_background_jobs: "media-repository-1"
       # ```
       # 
-      # FIXME: 
+      # TODO: 
       # 1) media_repository worker not functional; 
       # 2) stream_writers=account_data+presence+typing is buggy, 
       #    see `RoomTypingRestServlet._is_typing_writer` for more details.
@@ -110,6 +111,57 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
 
+  # LiveKit
+  lk_auth_service:
+    image: ghcr.io/element-hq/lk-jwt-service:latest-ci
+    hostname: auth-server
+    container_name: lk_auth_service
+    ports:
+      - 8881:8080
+    environment:
+      - LIVEKIT_URL=ws://localhost:7880
+      - LIVEKIT_KEY=devkey
+      - LIVEKIT_SECRET=secret
+    deploy:
+      restart_policy:
+        condition: on-failure
+    networks:
+      - lkbackend
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --dev --config /etc/livekit.yaml
+    container_name: lk_server
+    restart: unless-stopped
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882"
+      - "50100-50200:50100-50200"
+    volumes:
+      - ./livekit/livekit.yml:/etc/livekit.yaml
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - lkbackend
+
+  redis:
+    image: redis:6-alpine
+    container_name: redis
+    command: redis-server /etc/redis.conf
+    ports:
+      - 6379:6379
+    volumes:
+      - ./livekit/redis.conf:/etc/redis.conf
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - lkbackend
+
+  # PSQL
   pgadmin:
     container_name: pgadmin
     image: dpage/pgadmin4:latest
