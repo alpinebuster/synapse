@@ -1259,6 +1259,51 @@ class SyncHandler:
             await_full_state = True
             lazy_load_members = False
 
+        # For a non-gappy sync if the events in the timeline are simply a linear
+        # chain (i.e. no merging/branching of the graph), then we know the state
+        # delta between the end of the previous sync and start of the new one is
+        # empty.
+        #
+        # c.f. #16941 for an example of why we can't do this for all non-gappy
+        # syncs.
+        is_linear_timeline = True
+        if batch.events:
+            # We need to make sure the first event in our batch points to the
+            # last event in the previous batch.
+            last_event_id_prev_batch = (
+                await self.store.get_last_event_in_room_before_stream_ordering(
+                    room_id,
+                    end_token=since_token.room_key,
+                )
+            )
+
+            prev_event_id = last_event_id_prev_batch
+            for e in batch.events:
+                if e.prev_event_ids() != [prev_event_id]:
+                    is_linear_timeline = False
+                    break
+                prev_event_id = e.event_id
+
+        if is_linear_timeline and not batch.limited:
+            state_ids: StateMap[str] = {}
+            if lazy_load_members:
+                if members_to_fetch and batch.events:
+                    # We're lazy-loading, so the client might need some more
+                    # member events to understand the events in this timeline.
+                    # So we fish out all the member events corresponding to the
+                    # timeline here. The caller will then dedupe any redundant
+                    # ones.
+
+                    state_ids = await self._state_storage_controller.get_state_ids_for_event(
+                        batch.events[0].event_id,
+                        # we only want members!
+                        state_filter=StateFilter.from_types(
+                            (EventTypes.Member, member) for member in members_to_fetch
+                        ),
+                        await_full_state=False,
+                    )
+            return state_ids
+
         if batch:
             state_at_timeline_start = (
                 await self._state_storage_controller.get_state_ids_for_event(
