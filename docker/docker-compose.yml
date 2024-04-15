@@ -1,8 +1,6 @@
-# This compose file is compatible with Compose itself, it might need some
+# This compose file is compatible with `docker-compose` itself, it might need some
 # adjustments to run properly with stack.
 # 
-
-version: '3.9'
 
 networks:
   net:
@@ -111,7 +109,21 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
 
-  # LiveKit
+  conferencing:
+    container_name: conferencing
+    build:
+      context: ../../element-call
+      dockerfile: Dockerfile
+    pull_policy: never
+    image: alpinebuster/conferencing:latest
+    restart: unless-stopped
+    ports:
+      - "8084:80"
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+
+  # ######LiveKit######
   lk_auth_service:
     image: ghcr.io/element-hq/lk-jwt-service:latest-ci
     hostname: auth-server
@@ -140,7 +152,7 @@ services:
       - "7880:7880"
       - "7881:7881"
       - "7882:7882"
-      - "50100-50200:50100-50200"
+      - "60100-60200:60100-60200"
     volumes:
       - ./livekit/livekit.yml:/etc/livekit.yaml
       - /etc/timezone:/etc/timezone:ro
@@ -152,16 +164,17 @@ services:
     image: redis:6-alpine
     container_name: redis
     command: redis-server /etc/redis.conf
-    ports:
-      - 6379:6379
+    # ports:
+    #   - 16379:6379
     volumes:
       - ./livekit/redis.conf:/etc/redis.conf
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     networks:
       - lkbackend
+  # ######END of LiveKit######
 
-  # PSQL
+  # ######PSQL######
   pgadmin:
     container_name: pgadmin
     image: dpage/pgadmin4:latest
@@ -177,7 +190,7 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     ports:
-      - "8084:80"
+      - "8085:80"
     networks:
       - net
 
@@ -200,3 +213,4 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     command: postgres -c 'max_connections=1000' -c 'shared_buffers=3GB'
+  # ######END of PSQL######
