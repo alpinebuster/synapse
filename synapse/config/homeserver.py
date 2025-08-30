@@ -23,6 +23,7 @@ from .account_validity import AccountValidityConfig
 from .api import ApiConfig
 from .appservice import AppServiceConfig
 from .auth import AuthConfig
+from .auto_accept_invites import AutoAcceptInvitesConfig
 from .background_updates import BackgroundUpdateConfig
 from .cache import CacheConfig
 from .captcha import CaptchaConfig
@@ -35,6 +36,7 @@ from .federation import FederationConfig
 from .jwt import JWTConfig
 from .key import KeyConfig
 from .logger import LoggingConfig
+from .mas import MasConfig
 from .metrics import MetricsConfig
 from .modules import ModulesConfig
 from .oembed import OembedConfig
@@ -58,6 +60,7 @@ from .third_party_event_rules import ThirdPartyRulesConfig
 from .tls import TlsConfig
 from .tracer import TracerConfig
 from .user_directory import UserDirectoryConfig
+from .user_types import UserTypesConfig
 from .voip import VoipConfig
 from .workers import WorkerConfig
 
@@ -105,4 +108,8 @@ class HomeServerConfig(RootConfig):
         RedisConfig,
         ExperimentalConfig,
         BackgroundUpdateConfig,
+        AutoAcceptInvitesConfig,
+        UserTypesConfig,
+        # This must be last, as it checks for conflicts with other config options.
+        MasConfig,
     ]

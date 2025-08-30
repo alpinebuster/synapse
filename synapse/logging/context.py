@@ -20,7 +20,7 @@
 #
 #
 
-""" Thread-local-alike tracking of log contexts within synapse
+"""Thread-local-alike tracking of log contexts within synapse
 
 This module provides objects and utilities for tracking contexts through
 synapse code, so that log lines can include a request identifier, and so that
@@ -29,6 +29,7 @@ them.
 
 See doc/log_contexts.rst for details on how this works.
 """
+
 import logging
 import threading
 import typing
@@ -36,8 +37,10 @@ import warnings
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
+    Any,
     Awaitable,
     Callable,
+    Literal,
     Optional,
     Tuple,
     Type,
@@ -47,13 +50,12 @@ from typing import (
 )
 
 import attr
-from typing_extensions import Literal, ParamSpec
+from typing_extensions import ParamSpec
 
 from twisted.internet import defer, threads
 from twisted.python.threadpool import ThreadPool
 
 if TYPE_CHECKING:
-    from synapse.logging.scopecontextmanager import _LogContextScope
     from synapse.types import ISynapseReactor
 
 logger = logging.getLogger(__name__)
@@ -227,14 +229,13 @@ LoggingContextOrSentinel = Union["LoggingContext", "_Sentinel"]
 class _Sentinel:
     """Sentinel to represent the root context"""
 
-    __slots__ = ["previous_context", "finished", "request", "scope", "tag"]
+    __slots__ = ["previous_context", "finished", "request", "tag"]
 
     def __init__(self) -> None:
         # Minimal set for compatibility with LoggingContext
         self.previous_context = None
         self.finished = False
         self.request = None
-        self.scope = None
         self.tag = None
 
     def __str__(self) -> str:
@@ -287,7 +288,6 @@ class LoggingContext:
         "finished",
         "request",
         "tag",
-        "scope",
     ]
 
     def __init__(
@@ -308,7 +308,6 @@ class LoggingContext:
         self.main_thread = get_thread_id()
         self.request = None
         self.tag = ""
-        self.scope: Optional["_LogContextScope"] = None
 
         # keep track of whether we have hit the __exit__ block for this context
         # (suggesting that the the thing that created the context thinks it should
@@ -320,9 +319,6 @@ class LoggingContext:
         if self.parent_context is not None:
             # we track the current request_id
             self.request = self.parent_context.request
-
-            # we also track the current scope:
-            self.scope = self.parent_context.scope
 
         if request is not None:
             # the request param overrides the request from the parent context
@@ -751,7 +747,7 @@ def preserve_fn(
     f: Union[
         Callable[P, R],
         Callable[P, Awaitable[R]],
-    ]
+    ],
 ) -> Callable[P, "defer.Deferred[R]"]:
     """Function decorator which wraps the function with run_in_background"""
 
@@ -828,6 +824,45 @@ def run_in_background(
         # The function should have maintained the logcontext, so we can
         # optimise out the messing about
         return d
+
+    # The function may have reset the context before returning, so
+    # we need to restore it now.
+    ctx = set_current_context(current)
+
+    # The original context will be restored when the deferred
+    # completes, but there is nothing waiting for it, so it will
+    # get leaked into the reactor or some other function which
+    # wasn't expecting it. We therefore need to reset the context
+    # here.
+    #
+    # (If this feels asymmetric, consider it this way: we are
+    # effectively forking a new thread of execution. We are
+    # probably currently within a ``with LoggingContext()`` block,
+    # which is supposed to have a single entry and exit point. But
+    # by spawning off another deferred, we are effectively
+    # adding a new exit point.)
+    d.addBoth(_set_context_cb, ctx)
+    return d
+
+
+def run_coroutine_in_background(
+    coroutine: typing.Coroutine[Any, Any, R],
+) -> "defer.Deferred[R]":
+    """Run the coroutine, ensuring that the current context is restored after
+    return from the function, and that the sentinel context is set once the
+    deferred returned by the function completes.
+
+    Useful for wrapping coroutines that you don't yield or await on (for
+    instance because you want to pass it to deferred.gatherResults()).
+
+    This is a special case of `run_in_background` where we can accept a
+    coroutine directly rather than a function. We can do this because coroutines
+    do not run until called, and so calling an async function without awaiting
+    cannot change the log contexts.
+    """
+
+    current = current_context()
+    d = defer.ensureDeferred(coroutine)
 
     # The function may have reset the context before returning, so
     # we need to restore it now.

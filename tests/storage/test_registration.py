@@ -18,7 +18,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import UserTypes
 from synapse.api.errors import ThreepidValidationError
@@ -43,7 +43,6 @@ class RegistrationStoreTestCase(HomeserverTestCase):
 
         self.assertEqual(
             UserInfo(
-                # TODO(paul): Surely this field should be 'user_id', not 'name'
                 user_id=UserID.from_string(self.user_id),
                 is_admin=False,
                 is_guest=False,
@@ -57,6 +56,7 @@ class RegistrationStoreTestCase(HomeserverTestCase):
                 locked=False,
                 is_shadow_banned=False,
                 approved=True,
+                suspended=False,
             ),
             (self.get_success(self.store.get_user_by_id(self.user_id))),
         )

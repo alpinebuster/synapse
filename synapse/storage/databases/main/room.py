@@ -21,13 +21,11 @@
 #
 
 import logging
-from abc import abstractmethod
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
     AbstractSet,
     Any,
-    Awaitable,
     Collection,
     Dict,
     List,
@@ -53,21 +51,19 @@ from synapse.api.room_versions import RoomVersion, RoomVersions
 from synapse.config.homeserver import HomeServerConfig
 from synapse.events import EventBase
 from synapse.replication.tcp.streams.partial_state import UnPartialStatedRoomStream
-from synapse.storage._base import SQLBaseStore, db_to_json, make_in_list_sql_clause
+from synapse.storage._base import (
+    db_to_json,
+    make_in_list_sql_clause,
+)
 from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
     LoggingTransaction,
+    make_tuple_in_list_sql_clause,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
-from synapse.storage.engines import PostgresEngine
 from synapse.storage.types import Cursor
-from synapse.storage.util.id_generators import (
-    AbstractStreamIdGenerator,
-    IdGenerator,
-    MultiWriterIdGenerator,
-    StreamIdGenerator,
-)
+from synapse.storage.util.id_generators import IdGenerator, MultiWriterIdGenerator
 from synapse.types import JsonDict, RetentionPolicy, StrCollection, ThirdPartyInstanceID
 from synapse.util import json_encoder
 from synapse.util.caches.descriptors import cached, cachedList
@@ -81,6 +77,8 @@ logger = logging.getLogger(__name__)
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
 class RatelimitOverride:
+    # n.b. elsewhere in Synapse messages_per_second is represented as a float, but it is
+    # an integer in the database
     messages_per_second: int
     burst_count: int
 
@@ -155,29 +153,20 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
 
         self.config: HomeServerConfig = hs.config
 
-        self._un_partial_stated_rooms_stream_id_gen: AbstractStreamIdGenerator
+        self._un_partial_stated_rooms_stream_id_gen: MultiWriterIdGenerator
 
-        if isinstance(database.engine, PostgresEngine):
-            self._un_partial_stated_rooms_stream_id_gen = MultiWriterIdGenerator(
-                db_conn=db_conn,
-                db=database,
-                notifier=hs.get_replication_notifier(),
-                stream_name="un_partial_stated_room_stream",
-                instance_name=self._instance_name,
-                tables=[
-                    ("un_partial_stated_room_stream", "instance_name", "stream_id")
-                ],
-                sequence_name="un_partial_stated_room_stream_sequence",
-                # TODO(faster_joins, multiple writers) Support multiple writers.
-                writers=["master"],
-            )
-        else:
-            self._un_partial_stated_rooms_stream_id_gen = StreamIdGenerator(
-                db_conn,
-                hs.get_replication_notifier(),
-                "un_partial_stated_room_stream",
-                "stream_id",
-            )
+        self._un_partial_stated_rooms_stream_id_gen = MultiWriterIdGenerator(
+            db_conn=db_conn,
+            db=database,
+            notifier=hs.get_replication_notifier(),
+            stream_name="un_partial_stated_room_stream",
+            server_name=self.server_name,
+            instance_name=self._instance_name,
+            tables=[("un_partial_stated_room_stream", "instance_name", "stream_id")],
+            sequence_name="un_partial_stated_room_stream_sequence",
+            # TODO(faster_joins, multiple writers) Support multiple writers.
+            writers=["master"],
+        )
 
     def process_replication_position(
         self, stream_name: str, instance_name: str, token: int
@@ -620,6 +609,8 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         order_by: str,
         reverse_order: bool,
         search_term: Optional[str],
+        public_rooms: Optional[bool],
+        empty_rooms: Optional[bool],
     ) -> Tuple[List[Dict[str, Any]], int]:
         """Function to retrieve a paginated list of rooms as json.
 
@@ -631,30 +622,49 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             search_term: a string to filter room names,
                 canonical alias and room ids by.
                 Room ID must match exactly. Canonical alias must match a substring of the local part.
+            public_rooms: Optional flag to filter public and non-public rooms. If true, public rooms are queried.
+                    if false, public rooms are excluded from the query. When it is
+                    none (the default), both public rooms and none-public-rooms are queried.
+            empty_rooms: Optional flag to filter empty and non-empty rooms.
+                    A room is empty if joined_members is zero.
+                    If true, empty rooms are queried.
+                    if false, empty rooms are excluded from the query. When it is
+                    none (the default), both empty rooms and none-empty rooms are queried.
         Returns:
             A list of room dicts and an integer representing the total number of
             rooms that exist given this query
         """
         # Filter room names by a string
-        where_statement = ""
-        search_pattern: List[object] = []
+        filter_ = []
+        where_args = []
         if search_term:
-            where_statement = """
-                WHERE LOWER(state.name) LIKE ?
-                OR LOWER(state.canonical_alias) LIKE ?
-                OR state.room_id = ?
-            """
+            filter_ = [
+                "LOWER(state.name) LIKE ? OR "
+                "LOWER(state.canonical_alias) LIKE ? OR "
+                "state.room_id = ?"
+            ]
 
             # Our postgres db driver converts ? -> %s in SQL strings as that's the
             # placeholder for postgres.
             # HOWEVER, if you put a % into your SQL then everything goes wibbly.
             # To get around this, we're going to surround search_term with %'s
             # before giving it to the database in python instead
-            search_pattern = [
-                "%" + search_term.lower() + "%",
-                "#%" + search_term.lower() + "%:%",
+            where_args = [
+                f"%{search_term.lower()}%",
+                f"#%{search_term.lower()}%:%",
                 search_term,
             ]
+        if public_rooms is not None:
+            filter_arg = "1" if public_rooms else "0"
+            filter_.append(f"rooms.is_public = '{filter_arg}'")
+
+        if empty_rooms is not None:
+            if empty_rooms:
+                filter_.append("curr.joined_members = 0")
+            else:
+                filter_.append("curr.joined_members <> 0")
+
+        where_clause = "WHERE " + " AND ".join(filter_) if len(filter_) > 0 else ""
 
         # Set ordering
         if RoomSortOrder(order_by) == RoomSortOrder.SIZE:
@@ -731,7 +741,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             LIMIT ?
             OFFSET ?
         """.format(
-            where=where_statement,
+            where=where_clause,
             order_by=order_by_column,
             direction="ASC" if order_by_asc else "DESC",
         )
@@ -740,10 +750,12 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         count_sql = """
             SELECT count(*) FROM (
               SELECT room_id FROM room_stats_state state
+              INNER JOIN room_stats_current curr USING (room_id)
+              INNER JOIN rooms USING (room_id)
               {where}
             ) AS get_room_ids
         """.format(
-            where=where_statement,
+            where=where_clause,
         )
 
         def _get_rooms_paginate_txn(
@@ -751,7 +763,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         ) -> Tuple[List[Dict[str, Any]], int]:
             # Add the search term into the WHERE clause
             # and execute the data query
-            txn.execute(info_sql, search_pattern + [limit, start])
+            txn.execute(info_sql, where_args + [limit, start])
 
             # Refactor room query data into a structured dictionary
             rooms = []
@@ -781,7 +793,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             # Execute the count query
 
             # Add the search term into the WHERE clause if present
-            txn.execute(count_sql, search_pattern)
+            txn.execute(count_sql, where_args)
 
             room_count = cast(Tuple[int], txn.fetchone())
             return rooms, room_count[0]
@@ -1122,6 +1134,109 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
 
         return local_media_ids
 
+    def _quarantine_local_media_txn(
+        self,
+        txn: LoggingTransaction,
+        hashes: Set[str],
+        media_ids: Set[str],
+        quarantined_by: Optional[str],
+    ) -> int:
+        """Quarantine and unquarantine local media items.
+
+        Args:
+            txn (cursor)
+            hashes: A set of sha256 hashes for any media that should be quarantined
+            media_ids: A set of media IDs for any media that should be quarantined
+            quarantined_by: The ID of the user who initiated the quarantine request
+                If it is `None` media will be removed from quarantine
+        Returns:
+            The total number of media items quarantined
+        """
+        total_media_quarantined = 0
+
+        # Effectively a legacy path, update any media that was explicitly named.
+        if media_ids:
+            sql_many_clause_sql, sql_many_clause_args = make_in_list_sql_clause(
+                txn.database_engine, "media_id", media_ids
+            )
+            sql = f"""
+                UPDATE local_media_repository
+                SET quarantined_by = ?
+                WHERE {sql_many_clause_sql}"""
+
+            if quarantined_by is not None:
+                sql += " AND safe_from_quarantine = FALSE"
+
+            txn.execute(sql, [quarantined_by] + sql_many_clause_args)
+            # Note that a rowcount of -1 can be used to indicate no rows were affected.
+            total_media_quarantined += txn.rowcount if txn.rowcount > 0 else 0
+
+        # Update any media that was identified via hash.
+        if hashes:
+            sql_many_clause_sql, sql_many_clause_args = make_in_list_sql_clause(
+                txn.database_engine, "sha256", hashes
+            )
+            sql = f"""
+                UPDATE local_media_repository
+                SET quarantined_by = ?
+                WHERE {sql_many_clause_sql}"""
+
+            if quarantined_by is not None:
+                sql += " AND safe_from_quarantine = FALSE"
+
+            txn.execute(sql, [quarantined_by] + sql_many_clause_args)
+            total_media_quarantined += txn.rowcount if txn.rowcount > 0 else 0
+
+        return total_media_quarantined
+
+    def _quarantine_remote_media_txn(
+        self,
+        txn: LoggingTransaction,
+        hashes: Set[str],
+        media: Set[Tuple[str, str]],
+        quarantined_by: Optional[str],
+    ) -> int:
+        """Quarantine and unquarantine remote items
+
+        Args:
+            txn (cursor)
+            hashes: A set of sha256 hashes for any media that should be quarantined
+            media_ids: A set of tuples (media_origin, media_id) for any media that should be quarantined
+            quarantined_by: The ID of the user who initiated the quarantine request
+                If it is `None` media will be removed from quarantine
+        Returns:
+            The total number of media items quarantined
+        """
+        total_media_quarantined = 0
+
+        if media:
+            sql_in_list_clause, sql_args = make_tuple_in_list_sql_clause(
+                txn.database_engine,
+                ("media_origin", "media_id"),
+                media,
+            )
+            sql = f"""
+                UPDATE remote_media_cache
+                SET quarantined_by = ?
+                WHERE {sql_in_list_clause}"""
+
+            txn.execute(sql, [quarantined_by] + sql_args)
+            total_media_quarantined += txn.rowcount if txn.rowcount > 0 else 0
+
+        total_media_quarantined = 0
+        if hashes:
+            sql_many_clause_sql, sql_many_clause_args = make_in_list_sql_clause(
+                txn.database_engine, "sha256", hashes
+            )
+            sql = f"""
+                UPDATE remote_media_cache
+                SET quarantined_by = ?
+                WHERE {sql_many_clause_sql}"""
+            txn.execute(sql, [quarantined_by] + sql_many_clause_args)
+            total_media_quarantined += txn.rowcount if txn.rowcount > 0 else 0
+
+        return total_media_quarantined
+
     def _quarantine_media_txn(
         self,
         txn: LoggingTransaction,
@@ -1141,40 +1256,93 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         Returns:
             The total number of media items quarantined
         """
+        hashes = set()
+        media_ids = set()
+        remote_media = set()
 
-        # Update all the tables to set the quarantined_by flag
-        sql = """
-            UPDATE local_media_repository
-            SET quarantined_by = ?
-            WHERE media_id = ?
-        """
-
-        # set quarantine
-        if quarantined_by is not None:
-            sql += "AND safe_from_quarantine = FALSE"
-            txn.executemany(
-                sql, [(quarantined_by, media_id) for media_id in local_mxcs]
+        # First, determine the hashes of the media we want to delete.
+        # We also want the media_ids for any media that lacks a hash.
+        if local_mxcs:
+            hash_sql_many_clause_sql, hash_sql_many_clause_args = (
+                make_in_list_sql_clause(txn.database_engine, "media_id", local_mxcs)
             )
-        # remove from quarantine
-        else:
-            txn.executemany(
-                sql, [(quarantined_by, media_id) for media_id in local_mxcs]
+            hash_sql = f"SELECT sha256, media_id FROM local_media_repository WHERE {hash_sql_many_clause_sql}"
+            if quarantined_by is not None:
+                hash_sql += " AND safe_from_quarantine = FALSE"
+
+            txn.execute(hash_sql, hash_sql_many_clause_args)
+            for sha256, media_id in txn:
+                if sha256:
+                    hashes.add(sha256)
+                else:
+                    media_ids.add(media_id)
+
+        # Do the same for remote media
+        if remote_mxcs:
+            hash_sql_in_list_clause, hash_sql_args = make_tuple_in_list_sql_clause(
+                txn.database_engine,
+                ("media_origin", "media_id"),
+                remote_mxcs,
             )
 
-        # Note that a rowcount of -1 can be used to indicate no rows were affected.
-        total_media_quarantined = txn.rowcount if txn.rowcount > 0 else 0
+            hash_sql = f"SELECT sha256, media_origin, media_id FROM remote_media_cache WHERE {hash_sql_in_list_clause}"
+            txn.execute(hash_sql, hash_sql_args)
+            for sha256, media_origin, media_id in txn:
+                if sha256:
+                    hashes.add(sha256)
+                else:
+                    remote_media.add((media_origin, media_id))
 
-        txn.executemany(
-            """
-                UPDATE remote_media_cache
-                SET quarantined_by = ?
-                WHERE media_origin = ? AND media_id = ?
-            """,
-            ((quarantined_by, origin, media_id) for origin, media_id in remote_mxcs),
+        count = self._quarantine_local_media_txn(txn, hashes, media_ids, quarantined_by)
+        count += self._quarantine_remote_media_txn(
+            txn, hashes, remote_media, quarantined_by
         )
-        total_media_quarantined += txn.rowcount if txn.rowcount > 0 else 0
 
-        return total_media_quarantined
+        return count
+
+    async def block_room(self, room_id: str, user_id: str) -> None:
+        """Marks the room as blocked.
+
+        Can be called multiple times (though we'll only track the last user to
+        block this room).
+
+        Can be called on a room unknown to this homeserver.
+
+        Args:
+            room_id: Room to block
+            user_id: Who blocked it
+        """
+        await self.db_pool.simple_upsert(
+            table="blocked_rooms",
+            keyvalues={"room_id": room_id},
+            values={},
+            insertion_values={"user_id": user_id},
+            desc="block_room",
+        )
+        await self.db_pool.runInteraction(
+            "block_room_invalidation",
+            self._invalidate_cache_and_stream,
+            self.is_room_blocked,
+            (room_id,),
+        )
+
+    async def unblock_room(self, room_id: str) -> None:
+        """Remove the room from blocking list.
+
+        Args:
+            room_id: Room to unblock
+        """
+        await self.db_pool.simple_delete(
+            table="blocked_rooms",
+            keyvalues={"room_id": room_id},
+            desc="unblock_room",
+        )
+        await self.db_pool.runInteraction(
+            "block_room_invalidation",
+            self._invalidate_cache_and_stream,
+            self.is_room_blocked,
+            (room_id,),
+        )
 
     async def get_rooms_for_retention_period_in_range(
         self, min_ms: Optional[int], max_ms: Optional[int], include_null: bool = False
@@ -1377,12 +1545,41 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         partial_state_rooms = {row[0] for row in rows}
         return {room_id: room_id in partial_state_rooms for room_id in room_ids}
 
+    @cached(max_entries=10000, iterable=True)
+    async def get_partial_rooms(self) -> AbstractSet[str]:
+        """Get any "partial-state" rooms which the user is in.
+
+        This is fast as the set of partially stated rooms at any point across
+        the whole server is small, and so such a query is fast. This is also
+        faster than looking up whether a set of room ID's are partially stated
+        via `is_partial_state_room_batched(...)` because of the sheer amount of
+        CPU time looking all the rooms up in the cache.
+        """
+
+        def _get_partial_rooms_for_user_txn(
+            txn: LoggingTransaction,
+        ) -> AbstractSet[str]:
+            sql = """
+                SELECT room_id FROM partial_state_rooms
+            """
+            txn.execute(sql)
+            return {room_id for (room_id,) in txn}
+
+        return await self.db_pool.runInteraction(
+            "get_partial_rooms_for_user", _get_partial_rooms_for_user_txn
+        )
+
     async def get_join_event_id_and_device_lists_stream_id_for_partial_state(
         self, room_id: str
     ) -> Tuple[str, int]:
         """Get the event ID of the initial join that started the partial
         join, and the device list stream ID at the point we started the partial
         join.
+
+        This only returns the minimum device list stream ID at the time of
+        joining, not the full device list stream token. The only impact of this
+        is that we may be sending again device list updates that we've already
+        sent to some destinations, which is harmless.
         """
 
         return cast(
@@ -1399,6 +1596,9 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         return self._un_partial_stated_rooms_stream_id_gen.get_current_token_for_writer(
             instance_name
         )
+
+    def get_un_partial_stated_rooms_id_generator(self) -> MultiWriterIdGenerator:
+        return self._un_partial_stated_rooms_stream_id_gen
 
     async def get_un_partial_stated_rooms_between(
         self, last_id: int, current_id: int, room_ids: Collection[str]
@@ -1554,6 +1754,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
         direction: Direction = Direction.BACKWARDS,
         user_id: Optional[str] = None,
         room_id: Optional[str] = None,
+        event_sender_user_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], int]:
         """Retrieve a paginated list of event reports
 
@@ -1564,6 +1765,8 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 oldest first (forwards)
             user_id: search for user_id. Ignored if user_id is None
             room_id: search for room_id. Ignored if room_id is None
+                event_sender_user_id: search for the sender of the reported event. Ignored if
+                event_sender_user_id is None
         Returns:
             Tuple of:
                 json list of event reports
@@ -1583,6 +1786,10 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                 filters.append("er.room_id LIKE ?")
                 args.extend(["%" + room_id + "%"])
 
+            if event_sender_user_id:
+                filters.append("events.sender = ?")
+                args.extend([event_sender_user_id])
+
             if direction == Direction.BACKWARDS:
                 order = "DESC"
             else:
@@ -1598,11 +1805,10 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
             sql = """
                 SELECT COUNT(*) as total_event_reports
                 FROM event_reports AS er
+                LEFT JOIN events USING(event_id)
                 JOIN room_stats_state ON room_stats_state.room_id = er.room_id
                 {}
-                """.format(
-                where_clause
-            )
+                """.format(where_clause)
             txn.execute(sql, args)
             count = cast(Tuple[int], txn.fetchone())[0]
 
@@ -1618,8 +1824,7 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
                     room_stats_state.canonical_alias,
                     room_stats_state.name
                 FROM event_reports AS er
-                LEFT JOIN events
-                    ON events.event_id = er.event_id
+                LEFT JOIN events USING(event_id)
                 JOIN room_stats_state
                     ON room_stats_state.room_id = er.room_id
                 {where_clause}
@@ -1684,6 +1889,117 @@ class RoomWorkerStore(CacheInvalidationWorkerStore):
 
         return True
 
+    async def set_room_is_public(self, room_id: str, is_public: bool) -> None:
+        await self.db_pool.simple_update_one(
+            table="rooms",
+            keyvalues={"room_id": room_id},
+            updatevalues={"is_public": is_public},
+            desc="set_room_is_public",
+        )
+
+    async def set_room_is_public_appservice(
+        self, room_id: str, appservice_id: str, network_id: str, is_public: bool
+    ) -> None:
+        """Edit the appservice/network specific public room list.
+
+        Each appservice can have a number of published room lists associated
+        with them, keyed off of an appservice defined `network_id`, which
+        basically represents a single instance of a bridge to a third party
+        network.
+
+        Args:
+            room_id
+            appservice_id
+            network_id
+            is_public: Whether to publish or unpublish the room from the list.
+        """
+
+        if is_public:
+            await self.db_pool.simple_upsert(
+                table="appservice_room_list",
+                keyvalues={
+                    "appservice_id": appservice_id,
+                    "network_id": network_id,
+                    "room_id": room_id,
+                },
+                values={},
+                insertion_values={
+                    "appservice_id": appservice_id,
+                    "network_id": network_id,
+                    "room_id": room_id,
+                },
+                desc="set_room_is_public_appservice_true",
+            )
+        else:
+            await self.db_pool.simple_delete(
+                table="appservice_room_list",
+                keyvalues={
+                    "appservice_id": appservice_id,
+                    "network_id": network_id,
+                    "room_id": room_id,
+                },
+                desc="set_room_is_public_appservice_false",
+            )
+
+    async def has_auth_chain_index(self, room_id: str) -> bool:
+        """Check if the room has (or can have) a chain cover index.
+
+        Defaults to True if we don't have an entry in `rooms` table nor any
+        events for the room.
+        """
+
+        has_auth_chain_index = await self.db_pool.simple_select_one_onecol(
+            table="rooms",
+            keyvalues={"room_id": room_id},
+            retcol="has_auth_chain_index",
+            desc="has_auth_chain_index",
+            allow_none=True,
+        )
+
+        if has_auth_chain_index:
+            return True
+
+        # It's possible that we already have events for the room in our DB
+        # without a corresponding room entry. If we do then we don't want to
+        # mark the room as having an auth chain cover index.
+        max_ordering = await self.db_pool.simple_select_one_onecol(
+            table="events",
+            keyvalues={"room_id": room_id},
+            retcol="MAX(stream_ordering)",
+            allow_none=True,
+            desc="has_auth_chain_index_fallback",
+        )
+
+        return max_ordering is None
+
+    async def maybe_store_room_on_outlier_membership(
+        self, room_id: str, room_version: RoomVersion
+    ) -> None:
+        """
+        When we receive an invite or any other event over federation that may relate to a room
+        we are not in, store the version of the room if we don't already know the room version.
+        """
+        # It's possible that we already have events for the room in our DB
+        # without a corresponding room entry. If we do then we don't want to
+        # mark the room as having an auth chain cover index.
+        has_auth_chain_index = await self.has_auth_chain_index(room_id)
+
+        await self.db_pool.simple_upsert(
+            desc="maybe_store_room_on_outlier_membership",
+            table="rooms",
+            keyvalues={"room_id": room_id},
+            values={},
+            insertion_values={
+                "room_version": room_version.identifier,
+                "is_public": False,
+                # We don't worry about setting the `creator` here because
+                # we don't process any messages in a room while a user is
+                # invited (only after the join).
+                "creator": "",
+                "has_auth_chain_index": has_auth_chain_index,
+            },
+        )
+
 
 class _BackgroundUpdates:
     REMOVE_TOMESTONED_ROOMS_BG_UPDATE = "remove_tombstoned_rooms_from_directory"
@@ -1702,7 +2018,7 @@ _REPLACE_ROOM_DEPTH_SQL_COMMANDS = (
 )
 
 
-class RoomBackgroundUpdateStore(SQLBaseStore):
+class RoomBackgroundUpdateStore(RoomWorkerStore):
     def __init__(
         self,
         database: DatabasePool,
@@ -1935,45 +2251,6 @@ class RoomBackgroundUpdateStore(SQLBaseStore):
 
         return len(rooms)
 
-    @abstractmethod
-    def set_room_is_public(self, room_id: str, is_public: bool) -> Awaitable[None]:
-        # this will need to be implemented if a background update is performed with
-        # existing (tombstoned, public) rooms in the database.
-        #
-        # It's overridden by RoomStore for the synapse master.
-        raise NotImplementedError()
-
-    async def has_auth_chain_index(self, room_id: str) -> bool:
-        """Check if the room has (or can have) a chain cover index.
-
-        Defaults to True if we don't have an entry in `rooms` table nor any
-        events for the room.
-        """
-
-        has_auth_chain_index = await self.db_pool.simple_select_one_onecol(
-            table="rooms",
-            keyvalues={"room_id": room_id},
-            retcol="has_auth_chain_index",
-            desc="has_auth_chain_index",
-            allow_none=True,
-        )
-
-        if has_auth_chain_index:
-            return True
-
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        max_ordering = await self.db_pool.simple_select_one_onecol(
-            table="events",
-            keyvalues={"room_id": room_id},
-            retcol="MAX(stream_ordering)",
-            allow_none=True,
-            desc="has_auth_chain_index_fallback",
-        )
-
-        return max_ordering is None
-
     async def _background_populate_room_depth_min_depth2(
         self, progress: JsonDict, batch_size: int
     ) -> int:
@@ -2177,6 +2454,8 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         super().__init__(database, db_conn, hs)
 
         self._event_reports_id_gen = IdGenerator(db_conn, "event_reports", "id")
+        self._room_reports_id_gen = IdGenerator(db_conn, "room_reports", "id")
+        self._user_reports_id_gen = IdGenerator(db_conn, "user_reports", "id")
 
         self._instance_name = hs.get_instance_name()
 
@@ -2290,6 +2569,7 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         self._invalidate_cache_and_stream(
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
+        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
 
     async def write_partial_state_rooms_join_event_id(
         self,
@@ -2320,90 +2600,6 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             keyvalues={"room_id": room_id},
             updatevalues={"join_event_id": join_event_id},
         )
-
-    async def maybe_store_room_on_outlier_membership(
-        self, room_id: str, room_version: RoomVersion
-    ) -> None:
-        """
-        When we receive an invite or any other event over federation that may relate to a room
-        we are not in, store the version of the room if we don't already know the room version.
-        """
-        # It's possible that we already have events for the room in our DB
-        # without a corresponding room entry. If we do then we don't want to
-        # mark the room as having an auth chain cover index.
-        has_auth_chain_index = await self.has_auth_chain_index(room_id)
-
-        await self.db_pool.simple_upsert(
-            desc="maybe_store_room_on_outlier_membership",
-            table="rooms",
-            keyvalues={"room_id": room_id},
-            values={},
-            insertion_values={
-                "room_version": room_version.identifier,
-                "is_public": False,
-                # We don't worry about setting the `creator` here because
-                # we don't process any messages in a room while a user is
-                # invited (only after the join).
-                "creator": "",
-                "has_auth_chain_index": has_auth_chain_index,
-            },
-        )
-
-    async def set_room_is_public(self, room_id: str, is_public: bool) -> None:
-        await self.db_pool.simple_update_one(
-            table="rooms",
-            keyvalues={"room_id": room_id},
-            updatevalues={"is_public": is_public},
-            desc="set_room_is_public",
-        )
-
-        self.hs.get_notifier().on_new_replication_data()
-
-    async def set_room_is_public_appservice(
-        self, room_id: str, appservice_id: str, network_id: str, is_public: bool
-    ) -> None:
-        """Edit the appservice/network specific public room list.
-
-        Each appservice can have a number of published room lists associated
-        with them, keyed off of an appservice defined `network_id`, which
-        basically represents a single instance of a bridge to a third party
-        network.
-
-        Args:
-            room_id
-            appservice_id
-            network_id
-            is_public: Whether to publish or unpublish the room from the list.
-        """
-
-        if is_public:
-            await self.db_pool.simple_upsert(
-                table="appservice_room_list",
-                keyvalues={
-                    "appservice_id": appservice_id,
-                    "network_id": network_id,
-                    "room_id": room_id,
-                },
-                values={},
-                insertion_values={
-                    "appservice_id": appservice_id,
-                    "network_id": network_id,
-                    "room_id": room_id,
-                },
-                desc="set_room_is_public_appservice_true",
-            )
-        else:
-            await self.db_pool.simple_delete(
-                table="appservice_room_list",
-                keyvalues={
-                    "appservice_id": appservice_id,
-                    "network_id": network_id,
-                    "room_id": room_id,
-                },
-                desc="set_room_is_public_appservice_false",
-            )
-
-        self.hs.get_notifier().on_new_replication_data()
 
     async def add_event_report(
         self,
@@ -2442,49 +2638,67 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         )
         return next_id
 
-    async def block_room(self, room_id: str, user_id: str) -> None:
-        """Marks the room as blocked.
-
-        Can be called multiple times (though we'll only track the last user to
-        block this room).
-
-        Can be called on a room unknown to this homeserver.
-
-        Args:
-            room_id: Room to block
-            user_id: Who blocked it
-        """
-        await self.db_pool.simple_upsert(
-            table="blocked_rooms",
-            keyvalues={"room_id": room_id},
-            values={},
-            insertion_values={"user_id": user_id},
-            desc="block_room",
-        )
-        await self.db_pool.runInteraction(
-            "block_room_invalidation",
-            self._invalidate_cache_and_stream,
-            self.is_room_blocked,
-            (room_id,),
-        )
-
-    async def unblock_room(self, room_id: str) -> None:
-        """Remove the room from blocking list.
+    async def add_room_report(
+        self,
+        room_id: str,
+        user_id: str,
+        reason: str,
+        received_ts: int,
+    ) -> int:
+        """Add a room report
 
         Args:
-            room_id: Room to unblock
+            room_id: The room ID being reported.
+            user_id: User who reports the room.
+            reason: Description that the user specifies.
+            received_ts: Time when the user submitted the report (milliseconds).
+        Returns:
+            Id of the room report.
         """
-        await self.db_pool.simple_delete(
-            table="blocked_rooms",
-            keyvalues={"room_id": room_id},
-            desc="unblock_room",
+        next_id = self._room_reports_id_gen.get_next()
+        await self.db_pool.simple_insert(
+            table="room_reports",
+            values={
+                "id": next_id,
+                "received_ts": received_ts,
+                "room_id": room_id,
+                "user_id": user_id,
+                "reason": reason,
+            },
+            desc="add_room_report",
         )
-        await self.db_pool.runInteraction(
-            "block_room_invalidation",
-            self._invalidate_cache_and_stream,
-            self.is_room_blocked,
-            (room_id,),
+        return next_id
+
+    async def add_user_report(
+        self,
+        target_user_id: str,
+        user_id: str,
+        reason: str,
+        received_ts: int,
+    ) -> int:
+        """Add a user report
+
+        Args:
+            target_user_id: The user ID being reported.
+            user_id: User who reported the user.
+            reason: Description that the user specifies.
+            received_ts: Time when the user submitted the report (milliseconds).
+        Returns:
+            ID of the room report.
+        """
+        next_id = self._user_reports_id_gen.get_next()
+        await self.db_pool.simple_insert(
+            table="user_reports",
+            values={
+                "id": next_id,
+                "received_ts": received_ts,
+                "target_user_id": target_user_id,
+                "user_id": user_id,
+                "reason": reason,
+            },
+            desc="add_user_report",
         )
+        return next_id
 
     async def clear_partial_state_room(self, room_id: str) -> Optional[int]:
         """Clears the partial state flag for a room.
@@ -2499,7 +2713,9 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
             still contains events with partial state.
         """
         try:
-            async with self._un_partial_stated_rooms_stream_id_gen.get_next() as un_partial_state_room_stream_id:
+            async with (
+                self._un_partial_stated_rooms_stream_id_gen.get_next() as un_partial_state_room_stream_id
+            ):
                 await self.db_pool.runInteraction(
                     "clear_partial_state_room",
                     self._clear_partial_state_room_txn,
@@ -2536,6 +2752,7 @@ class RoomStore(RoomBackgroundUpdateStore, RoomWorkerStore):
         self._invalidate_cache_and_stream(
             txn, self._get_partial_state_servers_at_join, (room_id,)
         )
+        self._invalidate_all_cache_and_stream(txn, self.get_partial_rooms)
 
         DatabasePool.simple_insert_txn(
             txn,

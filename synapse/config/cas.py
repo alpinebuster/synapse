@@ -20,7 +20,7 @@
 #
 #
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 from synapse.config.sso import SsoAttributeRequirement
 from synapse.types import JsonDict
@@ -42,11 +42,16 @@ class CasConfig(Config):
         self.cas_enabled = cas_config and cas_config.get("enabled", True)
 
         if self.cas_enabled:
+            if not isinstance(cas_config, dict):
+                raise ConfigError("Must be a dictionary", ("cas_config",))
+
             self.cas_server_url = cas_config["server_url"]
 
             # TODO Update this to a _synapse URL.
             public_baseurl = self.root.server.public_baseurl
-            self.cas_service_url = public_baseurl + "_matrix/client/r0/login/cas/ticket"
+            self.cas_service_url: Optional[str] = (
+                public_baseurl + "_matrix/client/r0/login/cas/ticket"
+            )
 
             self.cas_protocol_version = cas_config.get("protocol_version")
             if (
@@ -66,6 +71,17 @@ class CasConfig(Config):
 
             self.cas_enable_registration = cas_config.get("enable_registration", True)
 
+            self.cas_allow_numeric_ids = cas_config.get("allow_numeric_ids")
+            self.cas_numeric_ids_prefix = cas_config.get("numeric_ids_prefix")
+            if (
+                self.cas_numeric_ids_prefix is not None
+                and self.cas_numeric_ids_prefix.isalnum() is False
+            ):
+                raise ConfigError(
+                    "Only alphanumeric characters are allowed for numeric IDs prefix",
+                    ("cas_config", "numeric_ids_prefix"),
+                )
+
             self.idp_name = cas_config.get("idp_name", "CAS")
             self.idp_icon = cas_config.get("idp_icon")
             self.idp_brand = cas_config.get("idp_brand")
@@ -77,6 +93,8 @@ class CasConfig(Config):
             self.cas_displayname_attribute = None
             self.cas_required_attributes = []
             self.cas_enable_registration = False
+            self.cas_allow_numeric_ids = False
+            self.cas_numeric_ids_prefix = "u"
 
 
 # CAS uses a legacy required attributes mapping, not the one provided by

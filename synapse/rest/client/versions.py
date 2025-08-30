@@ -4,7 +4,7 @@
 # Copyright 2019 The Matrix.org Foundation C.I.C.
 # Copyright 2017 Vector Creations Ltd
 # Copyright 2016 OpenMarket Ltd
-# Copyright (C) 2023 New Vector, Ltd
+# Copyright (C) 2023-2024 New Vector, Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -25,11 +25,11 @@ import logging
 import re
 from typing import TYPE_CHECKING, Tuple
 
-from twisted.web.server import Request
-
 from synapse.api.constants import RoomCreationPreset
 from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet
+from synapse.http.site import SynapseRequest
+from synapse.rest.admin.experimental_features import ExperimentalFeature
 from synapse.types import JsonDict
 
 if TYPE_CHECKING:
@@ -45,6 +45,8 @@ class VersionsRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.config = hs.config
+        self.auth = hs.get_auth()
+        self.store = hs.get_datastores().main
 
         # Calculate these once since they shouldn't change after start-up.
         self.e2ee_forced_public = (
@@ -60,7 +62,26 @@ class VersionsRestServlet(RestServlet):
             in self.config.room.encryption_enabled_by_default_for_room_presets
         )
 
-    def on_GET(self, request: Request) -> Tuple[int, JsonDict]:
+    async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
+        msc3881_enabled = self.config.experimental.msc3881_enabled
+        msc3575_enabled = self.config.experimental.msc3575_enabled
+
+        if self.auth.has_access_token(request):
+            requester = await self.auth.get_user_by_req(
+                request,
+                allow_guest=True,
+                allow_locked=True,
+                allow_expired=True,
+            )
+            user_id = requester.user.to_string()
+
+            msc3881_enabled = await self.store.is_feature_enabled(
+                user_id, ExperimentalFeature.MSC3881
+            )
+            msc3575_enabled = await self.store.is_feature_enabled(
+                user_id, ExperimentalFeature.MSC3575
+            )
+
         return (
             200,
             {
@@ -89,6 +110,9 @@ class VersionsRestServlet(RestServlet):
                     "v1.7",
                     "v1.8",
                     "v1.9",
+                    "v1.10",
+                    "v1.11",
+                    "v1.12",
                 ],
                 # as per MSC1497:
                 "unstable_features": {
@@ -123,12 +147,9 @@ class VersionsRestServlet(RestServlet):
                     # TODO: this is no longer needed once unstable MSC3882 does not need to be supported:
                     "org.matrix.msc3882": self.config.auth.login_via_existing_enabled,
                     # Adds support for remotely enabling/disabling pushers, as per MSC3881
-                    "org.matrix.msc3881": self.config.experimental.msc3881_enabled,
+                    "org.matrix.msc3881": msc3881_enabled,
                     # Adds support for filtering /messages by event relation.
                     "org.matrix.msc3874": self.config.experimental.msc3874_enabled,
-                    # Adds support for simple HTTP rendezvous as per MSC3886
-                    "org.matrix.msc3886": self.config.experimental.msc3886_endpoint
-                    is not None,
                     # Adds support for relation-based redactions as per MSC3912.
                     "org.matrix.msc3912": self.config.experimental.msc3912_enabled,
                     # Whether recursively provide relations is supported.
@@ -140,6 +161,24 @@ class VersionsRestServlet(RestServlet):
                     "org.matrix.msc4069": self.config.experimental.msc4069_profile_inhibit_propagation,
                     # Allows clients to handle push for encrypted events.
                     "org.matrix.msc4028": self.config.experimental.msc4028_push_encrypted_events,
+                    # MSC4108: Mechanism to allow OIDC sign in and E2EE set up via QR code
+                    "org.matrix.msc4108": (
+                        self.config.experimental.msc4108_enabled
+                        or (
+                            self.config.experimental.msc4108_delegation_endpoint
+                            is not None
+                        )
+                    ),
+                    # MSC4140: Delayed events
+                    "org.matrix.msc4140": bool(self.config.server.max_event_delay_ms),
+                    # Simplified sliding sync
+                    "org.matrix.simplified_msc3575": msc3575_enabled,
+                    # Arbitrary key-value profile fields.
+                    "uk.tcpip.msc4133": self.config.experimental.msc4133_enabled,
+                    # MSC4155: Invite filtering
+                    "org.matrix.msc4155": self.config.experimental.msc4155_enabled,
+                    # MSC4306: Support for thread subscriptions
+                    "org.matrix.msc4306": self.config.experimental.msc4306_enabled,
                 },
             },
         )

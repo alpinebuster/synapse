@@ -20,26 +20,38 @@
 #
 import time
 import urllib.parse
-from typing import Any, Collection, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
 from unittest.mock import Mock
 from urllib.parse import urlencode
 
 import pymacaroons
-from typing_extensions import Literal
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 from twisted.web.resource import Resource
 
 import synapse.rest.admin
 from synapse.api.constants import ApprovalNoticeMedium, LoginType
 from synapse.api.errors import Codes
+from synapse.api.urls import LoginSSORedirectURIBuilder
 from synapse.appservice import ApplicationService
+from synapse.http.client import RawHeaders
 from synapse.module_api import ModuleApi
-from synapse.rest.client import devices, login, logout, register
+from synapse.rest.client import account, devices, login, logout, profile, register
 from synapse.rest.client.account import WhoamiRestServlet
 from synapse.rest.synapse.client import build_synapse_client_resource_tree
 from synapse.server import HomeServer
-from synapse.types import JsonDict, create_requester
+from synapse.types import JsonDict, UserID, create_requester
 from synapse.util import Clock
 
 from tests import unittest
@@ -48,6 +60,7 @@ from tests.handlers.test_saml import has_saml2
 from tests.rest.client.utils import TEST_OIDC_CONFIG
 from tests.server import FakeChannel
 from tests.test_utils.html_parsers import TestHtmlParser
+from tests.test_utils.oidc import FakeOidcServer
 from tests.unittest import HomeserverTestCase, override_config, skip_unless
 
 try:
@@ -57,6 +70,10 @@ try:
 except ImportError:
     HAS_JWT = False
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 # synapse server name: used to populate public_baseurl in some tests
 SYNAPSE_SERVER_PUBLIC_HOSTNAME = "synapse"
@@ -65,7 +82,7 @@ SYNAPSE_SERVER_PUBLIC_HOSTNAME = "synapse"
 # FakeChannel.isSecure() returns False, so synapse will see the requested uri as
 # http://..., so using http in the public_baseurl stops Synapse trying to redirect to
 # https://....
-BASE_URL = "http://%s/" % (SYNAPSE_SERVER_PUBLIC_HOSTNAME,)
+PUBLIC_BASEURL = "http://%s/" % (SYNAPSE_SERVER_PUBLIC_HOSTNAME,)
 
 # CAS server used in some tests
 CAS_SERVER = "https://fake.test"
@@ -95,6 +112,23 @@ EXPECTED_CLIENT_REDIRECT_URL_PARAMS = [("<ab c>", ""), ('q" =+"', '"fö&=o"')]
 ADDITIONAL_LOGIN_FLOWS = [
     {"type": "m.login.application_service"},
 ]
+
+
+def get_relative_uri_from_absolute_uri(absolute_uri: str) -> str:
+    """
+    Peels off the path and query string from an absolute URI. Useful when interacting
+    with `make_request(...)` util function which expects a relative path instead of a
+    full URI.
+    """
+    parsed_uri = urllib.parse.urlparse(absolute_uri)
+    # Sanity check that we're working with an absolute URI
+    assert parsed_uri.scheme == "http" or parsed_uri.scheme == "https"
+
+    relative_uri = parsed_uri.path
+    if parsed_uri.query:
+        relative_uri += "?" + parsed_uri.query
+
+    return relative_uri
 
 
 class TestSpamChecker:
@@ -602,7 +636,7 @@ class MultiSSOTestCase(unittest.HomeserverTestCase):
     def default_config(self) -> Dict[str, Any]:
         config = super().default_config()
 
-        config["public_baseurl"] = BASE_URL
+        config["public_baseurl"] = PUBLIC_BASEURL
 
         config["cas_config"] = {
             "enabled": True,
@@ -640,6 +674,9 @@ class MultiSSOTestCase(unittest.HomeserverTestCase):
             }
         ]
         return config
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.login_sso_redirect_url_builder = LoginSSORedirectURIBuilder(hs.config)
 
     def create_resource_dict(self) -> Dict[str, Resource]:
         d = super().create_resource_dict()
@@ -716,6 +753,32 @@ class MultiSSOTestCase(unittest.HomeserverTestCase):
         self.assertEqual(channel.code, 302, channel.result)
         location_headers = channel.headers.getRawHeaders("Location")
         assert location_headers
+        sso_login_redirect_uri = location_headers[0]
+
+        # it should redirect us to the standard login SSO redirect flow
+        self.assertEqual(
+            sso_login_redirect_uri,
+            self.login_sso_redirect_url_builder.build_login_sso_redirect_uri(
+                idp_id="cas", client_redirect_url=TEST_CLIENT_REDIRECT_URL
+            ),
+        )
+
+        # follow the redirect
+        channel = self.make_request(
+            "GET",
+            # We have to make this relative to be compatible with `make_request(...)`
+            get_relative_uri_from_absolute_uri(sso_login_redirect_uri),
+            # We have to set the Host header to match the `public_baseurl` to avoid
+            # the extra redirect in the `SsoRedirectServlet` in order for the
+            # cookies to be visible.
+            custom_headers=[
+                ("Host", SYNAPSE_SERVER_PUBLIC_HOSTNAME),
+            ],
+        )
+
+        self.assertEqual(channel.code, 302, channel.result)
+        location_headers = channel.headers.getRawHeaders("Location")
+        assert location_headers
         cas_uri = location_headers[0]
         cas_uri_path, cas_uri_query = cas_uri.split("?", 1)
 
@@ -741,6 +804,32 @@ class MultiSSOTestCase(unittest.HomeserverTestCase):
         self.assertEqual(channel.code, 302, channel.result)
         location_headers = channel.headers.getRawHeaders("Location")
         assert location_headers
+        sso_login_redirect_uri = location_headers[0]
+
+        # it should redirect us to the standard login SSO redirect flow
+        self.assertEqual(
+            sso_login_redirect_uri,
+            self.login_sso_redirect_url_builder.build_login_sso_redirect_uri(
+                idp_id="saml", client_redirect_url=TEST_CLIENT_REDIRECT_URL
+            ),
+        )
+
+        # follow the redirect
+        channel = self.make_request(
+            "GET",
+            # We have to make this relative to be compatible with `make_request(...)`
+            get_relative_uri_from_absolute_uri(sso_login_redirect_uri),
+            # We have to set the Host header to match the `public_baseurl` to avoid
+            # the extra redirect in the `SsoRedirectServlet` in order for the
+            # cookies to be visible.
+            custom_headers=[
+                ("Host", SYNAPSE_SERVER_PUBLIC_HOSTNAME),
+            ],
+        )
+
+        self.assertEqual(channel.code, 302, channel.result)
+        location_headers = channel.headers.getRawHeaders("Location")
+        assert location_headers
         saml_uri = location_headers[0]
         saml_uri_path, saml_uri_query = saml_uri.split("?", 1)
 
@@ -761,10 +850,35 @@ class MultiSSOTestCase(unittest.HomeserverTestCase):
             # pick the default OIDC provider
             channel = self.make_request(
                 "GET",
-                "/_synapse/client/pick_idp?redirectUrl="
-                + urllib.parse.quote_plus(TEST_CLIENT_REDIRECT_URL)
-                + "&idp=oidc",
+                f"/_synapse/client/pick_idp?redirectUrl={urllib.parse.quote_plus(TEST_CLIENT_REDIRECT_URL)}&idp=oidc",
             )
+        self.assertEqual(channel.code, 302, channel.result)
+        location_headers = channel.headers.getRawHeaders("Location")
+        assert location_headers
+        sso_login_redirect_uri = location_headers[0]
+
+        # it should redirect us to the standard login SSO redirect flow
+        self.assertEqual(
+            sso_login_redirect_uri,
+            self.login_sso_redirect_url_builder.build_login_sso_redirect_uri(
+                idp_id="oidc", client_redirect_url=TEST_CLIENT_REDIRECT_URL
+            ),
+        )
+
+        with fake_oidc_server.patch_homeserver(hs=self.hs):
+            # follow the redirect
+            channel = self.make_request(
+                "GET",
+                # We have to make this relative to be compatible with `make_request(...)`
+                get_relative_uri_from_absolute_uri(sso_login_redirect_uri),
+                # We have to set the Host header to match the `public_baseurl` to avoid
+                # the extra redirect in the `SsoRedirectServlet` in order for the
+                # cookies to be visible.
+                custom_headers=[
+                    ("Host", SYNAPSE_SERVER_PUBLIC_HOSTNAME),
+                ],
+            )
+
         self.assertEqual(channel.code, 302, channel.result)
         location_headers = channel.headers.getRawHeaders("Location")
         assert location_headers
@@ -826,12 +940,38 @@ class MultiSSOTestCase(unittest.HomeserverTestCase):
         self.assertEqual(chan.json_body["user_id"], "@user1:test")
 
     def test_multi_sso_redirect_to_unknown(self) -> None:
-        """An unknown IdP should cause a 400"""
+        """An unknown IdP should cause a 404"""
         channel = self.make_request(
             "GET",
             "/_synapse/client/pick_idp?redirectUrl=http://x&idp=xyz",
         )
-        self.assertEqual(channel.code, 400, channel.result)
+        self.assertEqual(channel.code, 302, channel.result)
+        location_headers = channel.headers.getRawHeaders("Location")
+        assert location_headers
+        sso_login_redirect_uri = location_headers[0]
+
+        # it should redirect us to the standard login SSO redirect flow
+        self.assertEqual(
+            sso_login_redirect_uri,
+            self.login_sso_redirect_url_builder.build_login_sso_redirect_uri(
+                idp_id="xyz", client_redirect_url="http://x"
+            ),
+        )
+
+        # follow the redirect
+        channel = self.make_request(
+            "GET",
+            # We have to make this relative to be compatible with `make_request(...)`
+            get_relative_uri_from_absolute_uri(sso_login_redirect_uri),
+            # We have to set the Host header to match the `public_baseurl` to avoid
+            # the extra redirect in the `SsoRedirectServlet` in order for the
+            # cookies to be visible.
+            custom_headers=[
+                ("Host", SYNAPSE_SERVER_PUBLIC_HOSTNAME),
+            ],
+        )
+
+        self.assertEqual(channel.code, 404, channel.result)
 
     def test_client_idp_redirect_to_unknown(self) -> None:
         """If the client tries to pick an unknown IdP, return a 404"""
@@ -957,9 +1097,8 @@ class CASTestCase(unittest.HomeserverTestCase):
         # Test that the response is HTML.
         self.assertEqual(channel.code, 200, channel.result)
         content_type_header_value = ""
-        for header in channel.result.get("headers", []):
-            if header[0] == b"Content-Type":
-                content_type_header_value = header[1].decode("utf8")
+        for header in channel.headers.getRawHeaders("Content-Type", []):
+            content_type_header_value = header
 
         self.assertTrue(content_type_header_value.startswith("text/html"))
 
@@ -1036,6 +1175,7 @@ class JWTTestCase(unittest.HomeserverTestCase):
     servlets = [
         synapse.rest.admin.register_servlets_for_client_rest_resource,
         login.register_servlets,
+        profile.register_servlets,
     ]
 
     jwt_secret = "secret"
@@ -1122,18 +1262,18 @@ class JWTTestCase(unittest.HomeserverTestCase):
         channel = self.jwt_login({"sub": "kermit", "iss": "invalid"})
         self.assertEqual(channel.code, 403, msg=channel.result)
         self.assertEqual(channel.json_body["errcode"], "M_FORBIDDEN")
-        self.assertEqual(
+        self.assertRegex(
             channel.json_body["error"],
-            'JWT validation failed: invalid_claim: Invalid claim "iss"',
+            r"^JWT validation failed: invalid_claim: Invalid claim [\"']iss[\"']$",
         )
 
         # Not providing an issuer.
         channel = self.jwt_login({"sub": "kermit"})
         self.assertEqual(channel.code, 403, msg=channel.result)
         self.assertEqual(channel.json_body["errcode"], "M_FORBIDDEN")
-        self.assertEqual(
+        self.assertRegex(
             channel.json_body["error"],
-            'JWT validation failed: missing_claim: Missing "iss" claim',
+            r"^JWT validation failed: missing_claim: Missing [\"']iss[\"'] claim$",
         )
 
     def test_login_iss_no_config(self) -> None:
@@ -1154,18 +1294,18 @@ class JWTTestCase(unittest.HomeserverTestCase):
         channel = self.jwt_login({"sub": "kermit", "aud": "invalid"})
         self.assertEqual(channel.code, 403, msg=channel.result)
         self.assertEqual(channel.json_body["errcode"], "M_FORBIDDEN")
-        self.assertEqual(
+        self.assertRegex(
             channel.json_body["error"],
-            'JWT validation failed: invalid_claim: Invalid claim "aud"',
+            r"^JWT validation failed: invalid_claim: Invalid claim [\"']aud[\"']$",
         )
 
         # Not providing an audience.
         channel = self.jwt_login({"sub": "kermit"})
         self.assertEqual(channel.code, 403, msg=channel.result)
         self.assertEqual(channel.json_body["errcode"], "M_FORBIDDEN")
-        self.assertEqual(
+        self.assertRegex(
             channel.json_body["error"],
-            'JWT validation failed: missing_claim: Missing "aud" claim',
+            r"^JWT validation failed: missing_claim: Missing [\"']aud[\"'] claim$",
         )
 
     def test_login_aud_no_config(self) -> None:
@@ -1173,9 +1313,9 @@ class JWTTestCase(unittest.HomeserverTestCase):
         channel = self.jwt_login({"sub": "kermit", "aud": "invalid"})
         self.assertEqual(channel.code, 403, msg=channel.result)
         self.assertEqual(channel.json_body["errcode"], "M_FORBIDDEN")
-        self.assertEqual(
+        self.assertRegex(
             channel.json_body["error"],
-            'JWT validation failed: invalid_claim: Invalid claim "aud"',
+            r"^JWT validation failed: invalid_claim: Invalid claim [\"']aud[\"']$",
         )
 
     def test_login_default_sub(self) -> None:
@@ -1190,6 +1330,30 @@ class JWTTestCase(unittest.HomeserverTestCase):
         channel = self.jwt_login({"username": "frog"})
         self.assertEqual(channel.code, 200, msg=channel.result)
         self.assertEqual(channel.json_body["user_id"], "@frog:test")
+
+    @override_config(
+        {"jwt_config": {**base_config, "display_name_claim": "display_name"}}
+    )
+    def test_login_custom_display_name(self) -> None:
+        """Test setting a custom display name."""
+        localpart = "pinkie"
+        user_id = f"@{localpart}:test"
+        display_name = "Pinkie Pie"
+
+        # Perform the login, specifying a custom display name.
+        channel = self.jwt_login({"sub": localpart, "display_name": display_name})
+        self.assertEqual(channel.code, 200, msg=channel.result)
+        self.assertEqual(channel.json_body["user_id"], user_id)
+
+        # Fetch the user's display name and check that it was set correctly.
+        access_token = channel.json_body["access_token"]
+        channel = self.make_request(
+            "GET",
+            f"/_matrix/client/v3/profile/{user_id}/displayname",
+            access_token=access_token,
+        )
+        self.assertEqual(channel.code, 200, msg=channel.result)
+        self.assertEqual(channel.json_body["displayname"], display_name)
 
     def test_login_no_token(self) -> None:
         params = {"type": "org.matrix.login.jwt"}
@@ -1320,7 +1484,7 @@ class AppserviceLoginRestServletTestCase(unittest.HomeserverTestCase):
         self.service = ApplicationService(
             id="unique_identifier",
             token="some_token",
-            sender="@asbot:example.com",
+            sender=UserID.from_string("@asbot:example.com"),
             namespaces={
                 ApplicationService.NS_USERS: [
                     {"regex": r"@as_user.*", "exclusive": False}
@@ -1332,7 +1496,7 @@ class AppserviceLoginRestServletTestCase(unittest.HomeserverTestCase):
         self.another_service = ApplicationService(
             id="another__identifier",
             token="another_token",
-            sender="@as2bot:example.com",
+            sender=UserID.from_string("@as2bot:example.com"),
             namespaces={
                 ApplicationService.NS_USERS: [
                     {"regex": r"@as2_user.*", "exclusive": False}
@@ -1366,7 +1530,10 @@ class AppserviceLoginRestServletTestCase(unittest.HomeserverTestCase):
 
         params = {
             "type": login.LoginRestServlet.APPSERVICE_TYPE,
-            "identifier": {"type": "m.id.user", "user": self.service.sender},
+            "identifier": {
+                "type": "m.id.user",
+                "user": self.service.sender.to_string(),
+            },
         }
         channel = self.make_request(
             b"POST", LOGIN_URL, params, access_token=self.service.token
@@ -1421,16 +1588,32 @@ class AppserviceLoginRestServletTestCase(unittest.HomeserverTestCase):
 class UsernamePickerTestCase(HomeserverTestCase):
     """Tests for the username picker flow of SSO login"""
 
-    servlets = [login.register_servlets]
+    servlets = [
+        login.register_servlets,
+        profile.register_servlets,
+        account.register_servlets,
+    ]
+
+    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
+        self.http_client = Mock(spec=["get_file"])
+        self.http_client.get_file.side_effect = mock_get_file
+        hs = self.setup_test_homeserver(
+            proxied_blocklisted_http_client=self.http_client
+        )
+        return hs
 
     def default_config(self) -> Dict[str, Any]:
         config = super().default_config()
-        config["public_baseurl"] = BASE_URL
+        config["public_baseurl"] = PUBLIC_BASEURL
 
         config["oidc_config"] = {}
         config["oidc_config"].update(TEST_OIDC_CONFIG)
         config["oidc_config"]["user_mapping_provider"] = {
-            "config": {"display_name_template": "{{ user.displayname }}"}
+            "config": {
+                "display_name_template": "{{ user.displayname }}",
+                "email_template": "{{ user.email }}",
+                "picture_template": "{{ user.picture }}",
+            }
         }
 
         # whitelist this client URI so we redirect straight to it rather than
@@ -1443,15 +1626,22 @@ class UsernamePickerTestCase(HomeserverTestCase):
         d.update(build_synapse_client_resource_tree(self.hs))
         return d
 
-    def test_username_picker(self) -> None:
-        """Test the happy path of a username picker flow."""
-
-        fake_oidc_server = self.helper.fake_oidc_server()
-
+    def proceed_to_username_picker_page(
+        self,
+        fake_oidc_server: FakeOidcServer,
+        displayname: str,
+        email: str,
+        picture: str,
+    ) -> Tuple[str, str]:
         # do the start of the login flow
         channel, _ = self.helper.auth_via_oidc(
             fake_oidc_server,
-            {"sub": "tester", "displayname": "Jonny"},
+            {
+                "sub": "tester",
+                "displayname": displayname,
+                "picture": picture,
+                "email": email,
+            },
             TEST_CLIENT_REDIRECT_URL,
         )
 
@@ -1478,16 +1668,42 @@ class UsernamePickerTestCase(HomeserverTestCase):
         )
         session = username_mapping_sessions[session_id]
         self.assertEqual(session.remote_user_id, "tester")
-        self.assertEqual(session.display_name, "Jonny")
+        self.assertEqual(session.display_name, displayname)
+        self.assertEqual(session.emails, [email])
+        self.assertEqual(session.avatar_url, picture)
         self.assertEqual(session.client_redirect_url, TEST_CLIENT_REDIRECT_URL)
 
         # the expiry time should be about 15 minutes away
         expected_expiry = self.clock.time_msec() + (15 * 60 * 1000)
         self.assertApproximates(session.expiry_time_ms, expected_expiry, tolerance=1000)
 
+        return picker_url, session_id
+
+    def test_username_picker_use_displayname_avatar_and_email(self) -> None:
+        """Test the happy path of a username picker flow with using displayname, avatar and email."""
+
+        fake_oidc_server = self.helper.fake_oidc_server()
+
+        mxid = "@bobby:test"
+        displayname = "Jonny"
+        email = "bobby@test.com"
+        picture = "mxc://test/avatar_url"
+
+        picker_url, session_id = self.proceed_to_username_picker_page(
+            fake_oidc_server, displayname, email, picture
+        )
+
         # Now, submit a username to the username picker, which should serve a redirect
-        # to the completion page
-        content = urlencode({b"username": b"bobby"}).encode("utf8")
+        # to the completion page.
+        # Also specify that we should use the provided displayname, avatar and email.
+        content = urlencode(
+            {
+                b"username": b"bobby",
+                b"use_display_name": b"true",
+                b"use_avatar": b"true",
+                b"use_email": email,
+            }
+        ).encode("utf8")
         chan = self.make_request(
             "POST",
             path=picker_url,
@@ -1536,4 +1752,119 @@ class UsernamePickerTestCase(HomeserverTestCase):
             content={"type": "m.login.token", "token": login_token},
         )
         self.assertEqual(chan.code, 200, chan.result)
-        self.assertEqual(chan.json_body["user_id"], "@bobby:test")
+        self.assertEqual(chan.json_body["user_id"], mxid)
+
+        # ensure the displayname and avatar from the OIDC response have been configured for the user.
+        channel = self.make_request(
+            "GET", "/profile/" + mxid, access_token=chan.json_body["access_token"]
+        )
+        self.assertEqual(channel.code, 200, channel.result)
+        self.assertIn("mxc://test", channel.json_body["avatar_url"])
+        self.assertEqual(displayname, channel.json_body["displayname"])
+
+        # ensure the email from the OIDC response has been configured for the user.
+        channel = self.make_request(
+            "GET", "/account/3pid", access_token=chan.json_body["access_token"]
+        )
+        self.assertEqual(channel.code, 200, channel.result)
+        self.assertEqual(email, channel.json_body["threepids"][0]["address"])
+
+    def test_username_picker_dont_use_displayname_avatar_or_email(self) -> None:
+        """Test the happy path of a username picker flow without using displayname, avatar or email."""
+
+        fake_oidc_server = self.helper.fake_oidc_server()
+
+        mxid = "@bobby:test"
+        displayname = "Jonny"
+        email = "bobby@test.com"
+        picture = "mxc://test/avatar_url"
+        username = "bobby"
+
+        picker_url, session_id = self.proceed_to_username_picker_page(
+            fake_oidc_server, displayname, email, picture
+        )
+
+        # Now, submit a username to the username picker, which should serve a redirect
+        # to the completion page.
+        # Also specify that we should not use the provided displayname, avatar or email.
+        content = urlencode(
+            {
+                b"username": username,
+                b"use_display_name": b"false",
+                b"use_avatar": b"false",
+            }
+        ).encode("utf8")
+        chan = self.make_request(
+            "POST",
+            path=picker_url,
+            content=content,
+            content_is_form=True,
+            custom_headers=[
+                ("Cookie", "username_mapping_session=" + session_id),
+                # old versions of twisted don't do form-parsing without a valid
+                # content-length header.
+                ("Content-Length", str(len(content))),
+            ],
+        )
+        self.assertEqual(chan.code, 302, chan.result)
+        location_headers = chan.headers.getRawHeaders("Location")
+        assert location_headers
+
+        # send a request to the completion page, which should 302 to the client redirectUrl
+        chan = self.make_request(
+            "GET",
+            path=location_headers[0],
+            custom_headers=[("Cookie", "username_mapping_session=" + session_id)],
+        )
+        self.assertEqual(chan.code, 302, chan.result)
+        location_headers = chan.headers.getRawHeaders("Location")
+        assert location_headers
+
+        # ensure that the returned location matches the requested redirect URL
+        path, query = location_headers[0].split("?", 1)
+        self.assertEqual(path, "https://x")
+
+        # it will have url-encoded the params properly, so we'll have to parse them
+        params = urllib.parse.parse_qsl(
+            query, keep_blank_values=True, strict_parsing=True, errors="strict"
+        )
+        self.assertEqual(params[0:2], EXPECTED_CLIENT_REDIRECT_URL_PARAMS)
+        self.assertEqual(params[2][0], "loginToken")
+
+        # fish the login token out of the returned redirect uri
+        login_token = params[2][1]
+
+        # finally, submit the matrix login token to the login API, which gives us our
+        # matrix access token, mxid, and device id.
+        chan = self.make_request(
+            "POST",
+            "/login",
+            content={"type": "m.login.token", "token": login_token},
+        )
+        self.assertEqual(chan.code, 200, chan.result)
+        self.assertEqual(chan.json_body["user_id"], mxid)
+
+        # ensure the displayname and avatar from the OIDC response have not been configured for the user.
+        channel = self.make_request(
+            "GET", "/profile/" + mxid, access_token=chan.json_body["access_token"]
+        )
+        self.assertEqual(channel.code, 200, channel.result)
+        self.assertNotIn("avatar_url", channel.json_body)
+        self.assertEqual(username, channel.json_body["displayname"])
+
+        # ensure the email from the OIDC response has not been configured for the user.
+        channel = self.make_request(
+            "GET", "/account/3pid", access_token=chan.json_body["access_token"]
+        )
+        self.assertEqual(channel.code, 200, channel.result)
+        self.assertListEqual([], channel.json_body["threepids"])
+
+
+async def mock_get_file(
+    url: str,
+    output_stream: BinaryIO,
+    max_size: Optional[int] = None,
+    headers: Optional[RawHeaders] = None,
+    is_allowed_content_type: Optional[Callable[[str], bool]] = None,
+) -> Tuple[int, Dict[bytes, List[bytes]], str, int]:
+    return 0, {b"Content-Type": [b"image/png"]}, "", 200

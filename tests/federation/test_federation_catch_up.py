@@ -2,7 +2,7 @@ from typing import Callable, Collection, List, Optional, Tuple
 from unittest import mock
 from unittest.mock import AsyncMock, Mock
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes
 from synapse.events import EventBase
@@ -401,7 +401,10 @@ class FederationCatchUpTestCases(FederatingHomeserverTestCase):
         now = self.clock.time_msec()
         self.get_success(
             self.hs.get_datastores().main.set_destination_retry_timings(
-                "zzzerver", now, now, 24 * 60 * 60 * 1000  # retry in 1 day
+                "zzzerver",
+                now,
+                now,
+                24 * 60 * 60 * 1000,  # retry in 1 day
             )
         )
 

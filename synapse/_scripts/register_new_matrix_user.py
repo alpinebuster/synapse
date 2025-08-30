@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, Optional
 
 import requests
 import yaml
+from typing_extensions import Never
 
 _CONFLICTING_SHARED_SECRET_OPTS_ERROR = """\
 Conflicting options 'registration_shared_secret' and 'registration_shared_secret_path'
@@ -38,6 +39,10 @@ are both defined in config file.
 
 _NO_SHARED_SECRET_OPTS_ERROR = """\
 No 'registration_shared_secret' or 'registration_shared_secret_path' defined in config.
+"""
+
+_EMPTY_SHARED_SECRET_PATH_OPTS_ERROR = """\
+The secret given via `registration_shared_secret_path` must not be empty.
 """
 
 _DEFAULT_SERVER_URL = "http://localhost:8008"
@@ -52,6 +57,7 @@ def request_registration(
     user_type: Optional[str] = None,
     _print: Callable[[str], None] = print,
     exit: Callable[[int], None] = sys.exit,
+    exists_ok: bool = False,
 ) -> None:
     url = "%s/_synapse/admin/v1/register" % (server_location.rstrip("/"),)
 
@@ -97,6 +103,10 @@ def request_registration(
     r = requests.post(url, json=data)
 
     if r.status_code != 200:
+        response = r.json()
+        if exists_ok and response["errcode"] == "M_USER_IN_USE":
+            _print("User already exists. Skipping.")
+            return
         _print("ERROR! Received %d %s" % (r.status_code, r.reason))
         if 400 <= r.status_code < 500:
             try:
@@ -115,6 +125,7 @@ def register_new_user(
     shared_secret: str,
     admin: Optional[bool],
     user_type: Optional[str],
+    exists_ok: bool = False,
 ) -> None:
     if not user:
         try:
@@ -154,8 +165,20 @@ def register_new_user(
             admin = False
 
     request_registration(
-        user, password, server_location, shared_secret, bool(admin), user_type
+        user,
+        password,
+        server_location,
+        shared_secret,
+        bool(admin),
+        user_type,
+        exists_ok=exists_ok,
     )
+
+
+def bail(err_msg: str) -> Never:
+    """Prints the given message to stderr and exits."""
+    print(err_msg, file=sys.stderr)
+    sys.exit(1)
 
 
 def main() -> None:
@@ -174,10 +197,22 @@ def main() -> None:
         help="Local part of the new user. Will prompt if omitted.",
     )
     parser.add_argument(
+        "--exists-ok",
+        action="store_true",
+        help="Do not fail if user already exists.",
+    )
+    password_group = parser.add_mutually_exclusive_group()
+    password_group.add_argument(
         "-p",
         "--password",
         default=None,
-        help="New password for user. Will prompt if omitted.",
+        help="New password for user. Will prompt for a password if "
+        "this flag and `--password-file` are both omitted.",
+    )
+    password_group.add_argument(
+        "--password-file",
+        default=None,
+        help="File containing the new password for user. If set, will override `--password`.",
     )
     parser.add_argument(
         "-t",
@@ -185,6 +220,7 @@ def main() -> None:
         default=None,
         help="User type as specified in synapse.api.constants.UserTypes",
     )
+
     admin_group = parser.add_mutually_exclusive_group()
     admin_group.add_argument(
         "-a",
@@ -237,15 +273,25 @@ def main() -> None:
         assert config is not None
 
         secret = config.get("registration_shared_secret")
+        if not isinstance(secret, (str, type(None))):
+            bail("registration_shared_secret is not a string.")
         secret_file = config.get("registration_shared_secret_path")
-        if secret_file:
-            if secret:
-                print(_CONFLICTING_SHARED_SECRET_OPTS_ERROR, file=sys.stderr)
-                sys.exit(1)
+        if not isinstance(secret_file, (str, type(None))):
+            bail("registration_shared_secret_path is not a string.")
+
+        if not secret and not secret_file:
+            bail(_NO_SHARED_SECRET_OPTS_ERROR)
+        elif secret and secret_file:
+            bail(_CONFLICTING_SHARED_SECRET_OPTS_ERROR)
+        elif not secret and secret_file:
             secret = _read_file(secret_file, "registration_shared_secret_path").strip()
-        if not secret:
-            print(_NO_SHARED_SECRET_OPTS_ERROR, file=sys.stderr)
-            sys.exit(1)
+            if not secret:
+                bail(_EMPTY_SHARED_SECRET_PATH_OPTS_ERROR)
+
+    if args.password_file:
+        password = _read_file(args.password_file, "password-file").strip()
+    else:
+        password = args.password
 
     if args.server_url:
         server_url = args.server_url
@@ -270,7 +316,13 @@ def main() -> None:
         admin = args.admin
 
     register_new_user(
-        args.user, args.password, server_url, secret, admin, args.user_type
+        args.user,
+        password,
+        server_url,
+        secret,
+        admin,
+        args.user_type,
+        exists_ok=args.exists_ok,
     )
 
 

@@ -32,12 +32,14 @@ from twisted.internet import defer
 
 from synapse.api.constants import EduTypes
 from synapse.api.errors import CodeMessageException, Codes, NotFoundError, SynapseError
-from synapse.handlers.device import DeviceHandler
+from synapse.handlers.device import DeviceWriterHandler
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.logging.opentracing import log_kv, set_tag, tag_args, trace
 from synapse.types import (
     JsonDict,
     JsonMapping,
+    ScheduledTask,
+    TaskStatus,
     UserID,
     get_domain_from_id,
     get_verify_key_from_cross_signing_key,
@@ -45,12 +47,18 @@ from synapse.types import (
 from synapse.util import json_decoder
 from synapse.util.async_helpers import Linearizer, concurrently_execute
 from synapse.util.cancellation import cancellable
-from synapse.util.retryutils import NotRetryingDestination
+from synapse.util.retryutils import (
+    NotRetryingDestination,
+    filter_destinations_by_retry_limiter,
+)
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+ONE_TIME_KEY_UPLOAD = "one_time_key_upload_lock"
 
 
 class E2eKeysHandler:
@@ -62,11 +70,15 @@ class E2eKeysHandler:
         self._appservice_handler = hs.get_application_service_handler()
         self.is_mine = hs.is_mine
         self.clock = hs.get_clock()
+        self._worker_lock_handler = hs.get_worker_locks_handler()
+        self._task_scheduler = hs.get_task_scheduler()
 
         federation_registry = hs.get_federation_registry()
 
-        is_master = hs.config.worker.worker_app is None
-        if is_master:
+        # Only the first writer in the list should handle EDUs for signing key
+        # updates, so that we can use an in-memory linearizer instead of worker locks.
+        edu_writer = hs.config.worker.writers.device_lists[0]
+        if hs.get_instance_name() == edu_writer:
             edu_updater = SigningKeyEduUpdater(hs)
 
             # Only register this edu handler on master as it requires writing
@@ -80,6 +92,15 @@ class E2eKeysHandler:
             federation_registry.register_edu_handler(
                 EduTypes.UNSTABLE_SIGNING_KEY_UPDATE,
                 edu_updater.incoming_signing_key_update,
+            )
+        else:
+            federation_registry.register_instances_for_edu(
+                EduTypes.SIGNING_KEY_UPDATE,
+                [edu_writer],
+            )
+            federation_registry.register_instances_for_edu(
+                EduTypes.UNSTABLE_SIGNING_KEY_UPDATE,
+                [edu_writer],
             )
 
         # doesn't really work as part of the generic query API, because the
@@ -100,6 +121,10 @@ class E2eKeysHandler:
         )
         self._query_appservices_for_keys = (
             hs.config.experimental.msc3984_appservice_key_query
+        )
+
+        self._task_scheduler.register_action(
+            self._delete_old_one_time_keys_task, "delete_old_otks"
         )
 
     @trace
@@ -137,7 +162,37 @@ class E2eKeysHandler:
                 the number of in-flight queries at a time.
         """
         async with self._query_devices_linearizer.queue((from_user_id, from_device_id)):
-            device_keys_query: Dict[str, List[str]] = query_body.get("device_keys", {})
+
+            async def filter_device_key_query(
+                query: Dict[str, List[str]],
+            ) -> Dict[str, List[str]]:
+                if not self.config.experimental.msc4263_limit_key_queries_to_users_who_share_rooms:
+                    # Only ignore invalid user IDs, which is the same behaviour as if
+                    # the user existed but had no keys.
+                    return {
+                        user_id: v
+                        for user_id, v in query.items()
+                        if UserID.is_valid(user_id)
+                    }
+
+                # Strip invalid user IDs and user IDs the requesting user does not share rooms with.
+                valid_user_ids = [
+                    user_id for user_id in query.keys() if UserID.is_valid(user_id)
+                ]
+                allowed_user_ids = set(
+                    await self.store.do_users_share_a_room_joined_or_invited(
+                        from_user_id, valid_user_ids
+                    )
+                )
+                return {
+                    user_id: v
+                    for user_id, v in query.items()
+                    if user_id in allowed_user_ids
+                }
+
+            device_keys_query: Dict[str, List[str]] = await filter_device_key_query(
+                query_body.get("device_keys", {})
+            )
 
             # separate users by domain.
             # make a map from domain to user_id to device_ids
@@ -259,10 +314,8 @@ class E2eKeysHandler:
                 "%d destinations to query devices for", len(remote_queries_not_in_cache)
             )
 
-            async def _query(
-                destination_queries: Tuple[str, Dict[str, Iterable[str]]]
-            ) -> None:
-                destination, queries = destination_queries
+            async def _query(destination: str) -> None:
+                queries = remote_queries_not_in_cache[destination]
                 return await self._query_devices_for_destination(
                     results,
                     cross_signing_keys,
@@ -272,9 +325,27 @@ class E2eKeysHandler:
                     timeout,
                 )
 
+            # Only try and fetch keys for destinations that are not marked as
+            # down.
+            unfiltered_destinations = remote_queries_not_in_cache.keys()
+            filtered_destinations = set(
+                await filter_destinations_by_retry_limiter(
+                    unfiltered_destinations,
+                    self.clock,
+                    self.store,
+                    # Let's give an arbitrary grace period for those hosts that are
+                    # only recently down
+                    retry_due_within_ms=60 * 1000,
+                )
+            )
+            failures.update(
+                (dest, _NOT_READY_FOR_RETRY_FAILURE)
+                for dest in (unfiltered_destinations - filtered_destinations)
+            )
+
             await concurrently_execute(
                 _query,
-                remote_queries_not_in_cache.items(),
+                filtered_destinations,
                 10,
                 delay_cancellation=True,
             )
@@ -580,7 +651,7 @@ class E2eKeysHandler:
         3. Attempt to fetch fallback keys from the database.
 
         Args:
-            local_query: An iterable of tuples of (user ID, device ID, algorithm).
+            local_query: An iterable of tuples of (user ID, device ID, algorithm, number of keys).
             always_include_fallback_keys: True to always include fallback keys.
 
         Returns:
@@ -775,36 +846,17 @@ class E2eKeysHandler:
             "one_time_keys": A mapping from algorithm to number of keys for that
                 algorithm, including those previously persisted.
         """
-        # This can only be called from the main process.
-        assert isinstance(self.device_handler, DeviceHandler)
-
         time_now = self.clock.time_msec()
 
         # TODO: Validate the JSON to make sure it has the right keys.
         device_keys = keys.get("device_keys", None)
         if device_keys:
-            logger.info(
-                "Updating device_keys for device %r for user %s at %d",
-                device_id,
-                user_id,
-                time_now,
+            await self.upload_device_keys_for_user(
+                user_id=user_id,
+                device_id=device_id,
+                keys={"device_keys": device_keys},
             )
-            log_kv(
-                {
-                    "message": "Updating device_keys for user.",
-                    "user_id": user_id,
-                    "device_id": device_id,
-                }
-            )
-            # TODO: Sign the JSON with the server key
-            changed = await self.store.set_e2e_device_keys(
-                user_id, device_id, time_now, device_keys
-            )
-            if changed:
-                # Only notify about device updates *if* the keys actually changed
-                await self.device_handler.notify_device_update(user_id, [device_id])
-        else:
-            log_kv({"message": "Not updating device_keys for user", "user_id": user_id})
+
         one_time_keys = keys.get("one_time_keys", None)
         if one_time_keys:
             log_kv(
@@ -840,6 +892,46 @@ class E2eKeysHandler:
                 {"message": "Did not update fallback_keys", "reason": "no keys given"}
             )
 
+        result = await self.store.count_e2e_one_time_keys(user_id, device_id)
+
+        set_tag("one_time_key_counts", str(result))
+        return {"one_time_key_counts": result}
+
+    @tag_args
+    async def upload_device_keys_for_user(
+        self, user_id: str, device_id: str, keys: JsonDict
+    ) -> None:
+        """
+        Args:
+            user_id: user whose keys are being uploaded.
+            device_id: device whose keys are being uploaded.
+            device_keys: the `device_keys` of an /keys/upload request.
+
+        """
+        time_now = self.clock.time_msec()
+
+        device_keys = keys["device_keys"]
+        logger.info(
+            "Updating device_keys for device %r for user %s at %d",
+            device_id,
+            user_id,
+            time_now,
+        )
+        log_kv(
+            {
+                "message": "Updating device_keys for user.",
+                "user_id": user_id,
+                "device_id": device_id,
+            }
+        )
+        # TODO: Sign the JSON with the server key
+        changed = await self.store.set_e2e_device_keys(
+            user_id, device_id, time_now, device_keys
+        )
+        if changed:
+            # Only notify about device updates *if* the keys actually changed
+            await self.device_handler.notify_device_update(user_id, [device_id])
+
         # the device should have been registered already, but it may have been
         # deleted due to a race with a DELETE request. Or we may be using an
         # old access_token without an associated device_id. Either way, we
@@ -847,53 +939,56 @@ class E2eKeysHandler:
         # keys without a corresponding device.
         await self.device_handler.check_device_registered(user_id, device_id)
 
-        result = await self.store.count_e2e_one_time_keys(user_id, device_id)
-
-        set_tag("one_time_key_counts", str(result))
-        return {"one_time_key_counts": result}
-
     async def _upload_one_time_keys_for_user(
         self, user_id: str, device_id: str, time_now: int, one_time_keys: JsonDict
     ) -> None:
-        logger.info(
-            "Adding one_time_keys %r for device %r for user %r at %d",
-            one_time_keys.keys(),
-            device_id,
-            user_id,
-            time_now,
-        )
+        # We take out a lock so that we don't have to worry about a client
+        # sending duplicate requests.
+        lock_key = f"{user_id}_{device_id}"
+        async with self._worker_lock_handler.acquire_lock(
+            ONE_TIME_KEY_UPLOAD, lock_key
+        ):
+            logger.info(
+                "Adding one_time_keys %r for device %r for user %r at %d",
+                one_time_keys.keys(),
+                device_id,
+                user_id,
+                time_now,
+            )
 
-        # make a list of (alg, id, key) tuples
-        key_list = []
-        for key_id, key_obj in one_time_keys.items():
-            algorithm, key_id = key_id.split(":")
-            key_list.append((algorithm, key_id, key_obj))
+            # make a list of (alg, id, key) tuples
+            key_list = []
+            for key_id, key_obj in one_time_keys.items():
+                algorithm, key_id = key_id.split(":")
+                key_list.append((algorithm, key_id, key_obj))
 
-        # First we check if we have already persisted any of the keys.
-        existing_key_map = await self.store.get_e2e_one_time_keys(
-            user_id, device_id, [k_id for _, k_id, _ in key_list]
-        )
+            # First we check if we have already persisted any of the keys.
+            existing_key_map = await self.store.get_e2e_one_time_keys(
+                user_id, device_id, [k_id for _, k_id, _ in key_list]
+            )
 
-        new_keys = []  # Keys that we need to insert. (alg, id, json) tuples.
-        for algorithm, key_id, key in key_list:
-            ex_json = existing_key_map.get((algorithm, key_id), None)
-            if ex_json:
-                if not _one_time_keys_match(ex_json, key):
-                    raise SynapseError(
-                        400,
-                        (
-                            "One time key %s:%s already exists. "
-                            "Old key: %s; new key: %r"
+            new_keys = []  # Keys that we need to insert. (alg, id, json) tuples.
+            for algorithm, key_id, key in key_list:
+                ex_json = existing_key_map.get((algorithm, key_id), None)
+                if ex_json:
+                    if not _one_time_keys_match(ex_json, key):
+                        raise SynapseError(
+                            400,
+                            (
+                                "One time key %s:%s already exists. "
+                                "Old key: %s; new key: %r"
+                            )
+                            % (algorithm, key_id, ex_json, key),
                         )
-                        % (algorithm, key_id, ex_json, key),
+                else:
+                    new_keys.append(
+                        (algorithm, key_id, encode_canonical_json(key).decode("ascii"))
                     )
-            else:
-                new_keys.append(
-                    (algorithm, key_id, encode_canonical_json(key).decode("ascii"))
-                )
 
-        log_kv({"message": "Inserting new one_time_keys.", "keys": new_keys})
-        await self.store.add_e2e_one_time_keys(user_id, device_id, time_now, new_keys)
+            log_kv({"message": "Inserting new one_time_keys.", "keys": new_keys})
+            await self.store.add_e2e_one_time_keys(
+                user_id, device_id, time_now, new_keys
+            )
 
     async def upload_signing_keys_for_user(
         self, user_id: str, keys: JsonDict
@@ -904,9 +999,6 @@ class E2eKeysHandler:
             user_id: the user uploading the keys
             keys: the signing keys
         """
-        # This can only be called from the main process.
-        assert isinstance(self.device_handler, DeviceHandler)
-
         # if a master key is uploaded, then check it.  Otherwise, load the
         # stored master key, to check signatures on other keys
         if "master_key" in keys:
@@ -997,9 +1089,6 @@ class E2eKeysHandler:
         Raises:
             SynapseError: if the signatures dict is not valid.
         """
-        # This can only be called from the main process.
-        assert isinstance(self.device_handler, DeviceHandler)
-
         failures = {}
 
         # signatures to be stored.  Each item will be a SignatureListItem
@@ -1094,7 +1183,7 @@ class E2eKeysHandler:
             devices = devices[user_id]
         except SynapseError as e:
             failure = _exception_to_failure(e)
-            failures[user_id] = {device: failure for device in signatures.keys()}
+            failures[user_id] = dict.fromkeys(signatures.keys(), failure)
             return signature_list, failures
 
         for device_id, device in signatures.items():
@@ -1234,7 +1323,7 @@ class E2eKeysHandler:
         except SynapseError as e:
             failure = _exception_to_failure(e)
             for user, devicemap in signatures.items():
-                failures[user] = {device_id: failure for device_id in devicemap.keys()}
+                failures[user] = dict.fromkeys(devicemap.keys(), failure)
             return signature_list, failures
 
         for target_user, devicemap in signatures.items():
@@ -1275,9 +1364,7 @@ class E2eKeysHandler:
                     # other devices were signed -- mark those as failures
                     logger.debug("upload signature: too many devices specified")
                     failure = _exception_to_failure(NotFoundError("Unknown device"))
-                    failures[target_user] = {
-                        device: failure for device in other_devices
-                    }
+                    failures[target_user] = dict.fromkeys(other_devices, failure)
 
                 if user_signing_key_id in master_key.get("signatures", {}).get(
                     user_id, {}
@@ -1298,9 +1385,7 @@ class E2eKeysHandler:
             except SynapseError as e:
                 failure = _exception_to_failure(e)
                 if device_id is None:
-                    failures[target_user] = {
-                        device_id: failure for device_id in devicemap.keys()
-                    }
+                    failures[target_user] = dict.fromkeys(devicemap.keys(), failure)
                 else:
                     failures.setdefault(target_user, {})[device_id] = failure
 
@@ -1377,9 +1462,6 @@ class E2eKeysHandler:
             A tuple of the retrieved key content, the key's ID and the matching VerifyKey.
             If the key cannot be retrieved, all values in the tuple will instead be None.
         """
-        # This can only be called from the main process.
-        assert isinstance(self.device_handler, DeviceHandler)
-
         try:
             remote_result = await self.federation.query_user_devices(
                 user.domain, user.to_string()
@@ -1476,6 +1558,81 @@ class E2eKeysHandler:
         else:
             return exists, self.clock.time_msec() < ts_replacable_without_uia_before
 
+    async def has_different_keys(self, user_id: str, body: JsonDict) -> bool:
+        """
+        Check if a key provided in `body` differs from the same key stored in the DB. Returns
+        true on the first difference. If a key exists in `body` but does not exist in the DB,
+        returns True. If `body` has no keys, this always returns False.
+        Note by 'key' we mean Matrix key rather than JSON key.
+
+        The purpose of this function is to detect whether or not we need to apply UIA checks.
+        We must apply UIA checks if any key in the database is being overwritten. If a key is
+        being inserted for the first time, or if the key exactly matches what is in the database,
+        then no UIA check needs to be performed.
+
+        Args:
+            user_id: The user who sent the `body`.
+            body: The JSON request body from POST /keys/device_signing/upload
+        Returns:
+            True if any key in `body` has a different value in the database.
+        """
+        # Ensure that each key provided in the request body exactly matches the one we have stored.
+        # The first time we see the DB having a different key to the matching request key, bail.
+        # Note: we do not care if the DB has a key which the request does not specify, as we only
+        # care about *replacements* or *insertions* (i.e UPSERT)
+        req_body_key_to_db_key = {
+            "master_key": "master",
+            "self_signing_key": "self_signing",
+            "user_signing_key": "user_signing",
+        }
+        for req_body_key, db_key in req_body_key_to_db_key.items():
+            if req_body_key in body:
+                existing_key = await self.store.get_e2e_cross_signing_key(
+                    user_id, db_key
+                )
+                if existing_key != body[req_body_key]:
+                    return True
+        return False
+
+    async def _delete_old_one_time_keys_task(
+        self, task: ScheduledTask
+    ) -> Tuple[TaskStatus, Optional[JsonMapping], Optional[str]]:
+        """Scheduler task to delete old one time keys.
+
+        Until Synapse 1.119, Synapse used to issue one-time-keys in a random order, leading to the possibility
+        that it could still have old OTKs that the client has dropped. This task is scheduled exactly once
+        by a database schema delta file, and it clears out old one-time-keys that look like they came from libolm.
+        """
+        last_user = task.result.get("from_user", "") if task.result else ""
+        while True:
+            # We process users in batches of 100
+            users, rowcount = await self.store.delete_old_otks_for_next_user_batch(
+                last_user, 100
+            )
+            if len(users) == 0:
+                # We're done!
+                return TaskStatus.COMPLETE, None, None
+
+            logger.debug(
+                "Deleted %i old one-time-keys for users '%s'..'%s'",
+                rowcount,
+                users[0],
+                users[-1],
+            )
+            last_user = users[-1]
+
+            # Store our progress
+            await self._task_scheduler.update_task(
+                task.id, result={"from_user": last_user}
+            )
+
+            # Sleep a little before doing the next user.
+            #
+            # matrix.org has about 15M users in the e2e_one_time_keys_json table
+            # (comprising 20M devices). We want this to take about a week, so we need
+            # to do about one batch of 100 users every 4 seconds.
+            await self.clock.sleep(4)
+
 
 def _check_cross_signing_key(
     key: JsonDict, user_id: str, key_type: str, signing_key: Optional[VerifyKey] = None
@@ -1550,6 +1707,9 @@ def _check_device_signature(
         raise SynapseError(400, "Invalid signature", Codes.INVALID_SIGNATURE)
 
 
+_NOT_READY_FOR_RETRY_FAILURE = {"status": 503, "message": "Not ready for retry"}
+
+
 def _exception_to_failure(e: Exception) -> JsonDict:
     if isinstance(e, SynapseError):
         return {"status": e.code, "errcode": e.errcode, "message": str(e)}
@@ -1558,7 +1718,7 @@ def _exception_to_failure(e: Exception) -> JsonDict:
         return {"status": e.code, "message": str(e)}
 
     if isinstance(e, NotRetryingDestination):
-        return {"status": 503, "message": "Not ready for retry"}
+        return _NOT_READY_FOR_RETRY_FAILURE
 
     # include ConnectionRefused and other errors
     #
@@ -1602,7 +1762,7 @@ class SigningKeyEduUpdater:
         self.clock = hs.get_clock()
 
         device_handler = hs.get_device_handler()
-        assert isinstance(device_handler, DeviceHandler)
+        assert isinstance(device_handler, DeviceWriterHandler)
         self._device_handler = device_handler
 
         self._remote_edu_linearizer = Linearizer(name="remote_signing_key")

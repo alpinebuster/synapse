@@ -20,8 +20,7 @@
 #
 #
 
-"""An interactive script for doing a release. See `cli()` below.
-"""
+"""An interactive script for doing a release. See `cli()` below."""
 
 import glob
 import json
@@ -37,11 +36,11 @@ from typing import Any, List, Match, Optional, Union
 
 import attr
 import click
-import commonmark
 import git
 from click.exceptions import ClickException
 from git import GitCommandError, Repo
-from github import Github
+from github import BadCredentialsException, Github
+from markdown_it import MarkdownIt
 from packaging import version
 
 
@@ -70,6 +69,7 @@ def cli() -> None:
             pip install -e .[dev]
 
       - A checkout of the sytest repository at ../sytest
+      - A checkout of the complement repository at ../complement
 
     Then to use:
 
@@ -112,10 +112,12 @@ def _prepare() -> None:
     # Make sure we're in a git repo.
     synapse_repo = get_repo_and_check_clean_checkout()
     sytest_repo = get_repo_and_check_clean_checkout("../sytest", "sytest")
+    complement_repo = get_repo_and_check_clean_checkout("../complement", "complement")
 
     click.secho("Updating Synapse and Sytest git repos...")
     synapse_repo.remote().fetch()
     sytest_repo.remote().fetch()
+    complement_repo.remote().fetch()
 
     # Get the current version and AST from root Synapse module.
     current_version = get_package_version()
@@ -208,7 +210,15 @@ def _prepare() -> None:
             "Which branch should the release be based on?", default=default
         )
 
-        for repo_name, repo in {"synapse": synapse_repo, "sytest": sytest_repo}.items():
+        for repo_name, repo in {
+            "synapse": synapse_repo,
+            "sytest": sytest_repo,
+            "complement": complement_repo,
+        }.items():
+            # Special case for Complement: `develop` maps to `main`
+            if repo_name == "complement" and branch_name == "develop":
+                branch_name = "main"
+
             base_branch = find_ref(repo, branch_name)
             if not base_branch:
                 print(f"Could not find base branch {branch_name} for {repo_name}!")
@@ -231,12 +241,24 @@ def _prepare() -> None:
         if click.confirm("Push new SyTest branch?", default=True):
             sytest_repo.git.push("-u", sytest_repo.remote().name, release_branch_name)
 
+        # Same for Complement
+        if click.confirm("Push new Complement branch?", default=True):
+            complement_repo.git.push(
+                "-u", complement_repo.remote().name, release_branch_name
+            )
+
     # Switch to the release branch and ensure it's up to date.
     synapse_repo.git.checkout(release_branch_name)
     update_branch(synapse_repo)
 
     # Update the version specified in pyproject.toml.
     subprocess.check_output(["poetry", "version", new_version])
+
+    # Update config schema $id.
+    schema_file = "schema/synapse-config.schema.yaml"
+    major_minor_version = ".".join(new_version.split(".")[:2])
+    url = f"https://element-hq.github.io/synapse/schema/synapse/v{major_minor_version}/synapse-config.schema.json"
+    subprocess.check_output(["sed", "-i", f"0,/^\\$id: .*/s||$id: {url}|", schema_file])
 
     # Generate changelogs.
     generate_and_write_changelog(synapse_repo, current_version, new_version)
@@ -306,6 +328,9 @@ def tag(gh_token: Optional[str]) -> None:
 
 def _tag(gh_token: Optional[str]) -> None:
     """Tags the release and generates a draft GitHub release"""
+
+    # Test that the GH Token is valid before continuing.
+    check_valid_gh_token(gh_token)
 
     # Make sure we're in a git repo.
     repo = get_repo_and_check_clean_checkout()
@@ -401,6 +426,11 @@ def publish(gh_token: str) -> None:
 def _publish(gh_token: str) -> None:
     """Publish release on GitHub."""
 
+    if gh_token:
+        # Test that the GH Token is valid before continuing.
+        gh = Github(gh_token)
+        gh.get_user()
+
     # Make sure we're in a git repo.
     get_repo_and_check_clean_checkout()
 
@@ -442,6 +472,9 @@ def upload(gh_token: Optional[str]) -> None:
 
 def _upload(gh_token: Optional[str]) -> None:
     """Upload release to pypi."""
+
+    # Test that the GH Token is valid before continuing.
+    check_valid_gh_token(gh_token)
 
     current_version = get_package_version()
     tag_name = f"v{current_version}"
@@ -538,6 +571,9 @@ def wait_for_actions(gh_token: Optional[str]) -> None:
 
 
 def _wait_for_actions(gh_token: Optional[str]) -> None:
+    # Test that the GH Token is valid before continuing.
+    check_valid_gh_token(gh_token)
+
     # Find out the version and tag name.
     current_version = get_package_version()
     tag_name = f"v{current_version}"
@@ -562,7 +598,7 @@ def _wait_for_actions(gh_token: Optional[str]) -> None:
         if all(
             workflow["status"] != "in_progress" for workflow in resp["workflow_runs"]
         ):
-            success = (
+            success = all(
                 workflow["status"] == "completed" for workflow in resp["workflow_runs"]
             )
             if success:
@@ -630,6 +666,9 @@ def _merge_back() -> None:
     else:
         # Full release
         sytest_repo = get_repo_and_check_clean_checkout("../sytest", "sytest")
+        complement_repo = get_repo_and_check_clean_checkout(
+            "../complement", "complement"
+        )
 
         if click.confirm(f"Merge {branch_name} → master?", default=True):
             _merge_into(synapse_repo, branch_name, "master")
@@ -642,6 +681,9 @@ def _merge_back() -> None:
 
         if click.confirm("On SyTest, merge master → develop?", default=True):
             _merge_into(sytest_repo, "master", "develop")
+
+        if click.confirm(f"On Complement, merge {branch_name} → main?", default=True):
+            _merge_into(complement_repo, branch_name, "main")
 
 
 @cli.command()
@@ -688,6 +730,11 @@ Ask the designated people to do the blog and tweets."""
 @cli.command()
 @click.option("--gh-token", envvar=["GH_TOKEN", "GITHUB_TOKEN"], required=True)
 def full(gh_token: str) -> None:
+    if gh_token:
+        # Test that the GH Token is valid before continuing.
+        gh = Github(gh_token)
+        gh.get_user()
+
     click.echo("1. If this is a security release, read the security wiki page.")
     click.echo("2. Check for any release blockers before proceeding.")
     click.echo("    https://github.com/element-hq/synapse/labels/X-Release-Blocker")
@@ -759,6 +806,22 @@ def get_repo_and_check_clean_checkout(
     return repo
 
 
+def check_valid_gh_token(gh_token: Optional[str]) -> None:
+    """Check that a github token is valid, if supplied"""
+
+    if not gh_token:
+        # No github token supplied, so nothing to do.
+        return
+
+    try:
+        gh = Github(gh_token)
+
+        # We need to lookup name to trigger a request.
+        _name = gh.get_user().name
+    except BadCredentialsException as e:
+        raise click.ClickException(f"Github credentials are bad: {e}")
+
+
 def find_ref(repo: git.Repo, ref_name: str) -> Optional[git.HEAD]:
     """Find the branch/ref, looking first locally then in the remote."""
     if ref_name in repo.references:
@@ -788,7 +851,7 @@ def get_changes_for_version(wanted_version: version.Version) -> str:
 
     # First we parse the changelog so that we can split it into sections based
     # on the release headings.
-    ast = commonmark.Parser().parse(changes)
+    tokens = MarkdownIt().parse(changes)
 
     @attr.s(auto_attribs=True)
     class VersionSection:
@@ -799,19 +862,22 @@ def get_changes_for_version(wanted_version: version.Version) -> str:
         end_line: Optional[int] = None  # Is none if its the last entry
 
     headings: List[VersionSection] = []
-    for node, _ in ast.walker():
-        # We look for all text nodes that are in a level 1 heading.
-        if node.t != "text":
+    for i, token in enumerate(tokens):
+        # We look for level 1 headings (h1 tags).
+        if token.type != "heading_open" or token.tag != "h1":
             continue
 
-        if node.parent.t != "heading" or node.parent.level != 1:
-            continue
+        # The next token should be an inline token containing the heading text
+        if i + 1 < len(tokens) and tokens[i + 1].type == "inline":
+            heading_text = tokens[i + 1].content
+            # The map property contains [line_begin, line_end] (0-based)
+            start_line = token.map[0] if token.map else 0
 
-        # If we have a previous heading then we update its `end_line`.
-        if headings:
-            headings[-1].end_line = node.parent.sourcepos[0][0] - 1
+            # If we have a previous heading then we update its `end_line`.
+            if headings:
+                headings[-1].end_line = start_line
 
-        headings.append(VersionSection(node.literal, node.parent.sourcepos[0][0] - 1))
+            headings.append(VersionSection(heading_text, start_line))
 
     changes_by_line = changes.split("\n")
 

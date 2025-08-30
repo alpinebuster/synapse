@@ -20,7 +20,7 @@
 from typing import Tuple
 from unittest.mock import AsyncMock, Mock
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, LimitBlockingTypes, ServerNoticeMsgType
 from synapse.api.errors import ResourceLimitError
@@ -89,7 +89,7 @@ class TestResourceLimitsServerNotices(unittest.HomeserverTestCase):
             return_value="!something:localhost"
         )
         self._rlsn._store.add_tag_to_room = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        self._rlsn._store.get_tags_for_room = AsyncMock(return_value={})  # type: ignore[method-assign]
+        self._rlsn._store.get_tags_for_room = AsyncMock(return_value={})
 
     @override_config({"hs_disabled": True})
     def test_maybe_send_server_notice_disabled_hs(self) -> None:

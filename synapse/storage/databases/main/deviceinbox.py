@@ -42,6 +42,7 @@ from synapse.logging.opentracing import (
     start_active_span,
     trace,
 )
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.replication.tcp.streams import ToDeviceStream
 from synapse.storage._base import SQLBaseStore, db_to_json
 from synapse.storage.database import (
@@ -50,21 +51,30 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
-from synapse.storage.engines import PostgresEngine
-from synapse.storage.util.id_generators import (
-    AbstractStreamIdGenerator,
-    MultiWriterIdGenerator,
-    StreamIdGenerator,
-)
-from synapse.types import JsonDict
-from synapse.util import json_encoder
+from synapse.storage.util.id_generators import MultiWriterIdGenerator
+from synapse.types import JsonDict, StrCollection
+from synapse.util import Duration, json_encoder
 from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.caches.stream_change_cache import StreamChangeCache
+from synapse.util.iterutils import batch_iter
+from synapse.util.stringutils import parse_and_validate_server_name
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+# How long to keep messages in the device federation inbox before deleting them.
+DEVICE_FEDERATION_INBOX_CLEANUP_DELAY_MS = 7 * Duration.DAY_MS
+
+# How often to run the task to clean up old device_federation_inbox rows.
+DEVICE_FEDERATION_INBOX_CLEANUP_INTERVAL_MS = 5 * Duration.MINUTE_MS
+
+# Update name for the device federation inbox received timestamp index.
+DEVICE_FEDERATION_INBOX_RECEIVED_INDEX_UPDATE = (
+    "device_federation_inbox_received_ts_index"
+)
 
 
 class DeviceInboxWorkerStore(SQLBaseStore):
@@ -84,40 +94,30 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             Tuple[str, Optional[str]], int
         ] = ExpiringCache(
             cache_name="last_device_delete_cache",
+            server_name=self.server_name,
             clock=self._clock,
             max_len=10000,
             expiry_ms=30 * 60 * 1000,
         )
 
-        if isinstance(database.engine, PostgresEngine):
-            self._can_write_to_device = (
-                self._instance_name in hs.config.worker.writers.to_device
-            )
+        self._can_write_to_device = (
+            self._instance_name in hs.config.worker.writers.to_device
+        )
 
-            self._to_device_msg_id_gen: AbstractStreamIdGenerator = (
-                MultiWriterIdGenerator(
-                    db_conn=db_conn,
-                    db=database,
-                    notifier=hs.get_replication_notifier(),
-                    stream_name="to_device",
-                    instance_name=self._instance_name,
-                    tables=[
-                        ("device_inbox", "instance_name", "stream_id"),
-                        ("device_federation_outbox", "instance_name", "stream_id"),
-                    ],
-                    sequence_name="device_inbox_sequence",
-                    writers=hs.config.worker.writers.to_device,
-                )
-            )
-        else:
-            self._can_write_to_device = True
-            self._to_device_msg_id_gen = StreamIdGenerator(
-                db_conn,
-                hs.get_replication_notifier(),
-                "device_inbox",
-                "stream_id",
-                extra_tables=[("device_federation_outbox", "stream_id")],
-            )
+        self._to_device_msg_id_gen: MultiWriterIdGenerator = MultiWriterIdGenerator(
+            db_conn=db_conn,
+            db=database,
+            notifier=hs.get_replication_notifier(),
+            stream_name="to_device",
+            server_name=self.server_name,
+            instance_name=self._instance_name,
+            tables=[
+                ("device_inbox", "instance_name", "stream_id"),
+                ("device_federation_outbox", "instance_name", "stream_id"),
+            ],
+            sequence_name="device_inbox_sequence",
+            writers=hs.config.worker.writers.to_device,
+        )
 
         max_device_inbox_id = self._to_device_msg_id_gen.get_current_token()
         device_inbox_prefill, min_device_inbox_id = self.db_pool.get_cache_dict(
@@ -129,8 +129,9 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             limit=1000,
         )
         self._device_inbox_stream_cache = StreamChangeCache(
-            "DeviceInboxStreamChangeCache",
-            min_device_inbox_id,
+            name="DeviceInboxStreamChangeCache",
+            server_name=self.server_name,
+            current_stream_pos=min_device_inbox_id,
             prefilled_cache=device_inbox_prefill,
         )
 
@@ -145,10 +146,20 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             limit=1000,
         )
         self._device_federation_outbox_stream_cache = StreamChangeCache(
-            "DeviceFederationOutboxStreamChangeCache",
-            min_device_outbox_id,
+            name="DeviceFederationOutboxStreamChangeCache",
+            server_name=self.server_name,
+            current_stream_pos=min_device_outbox_id,
             prefilled_cache=device_outbox_prefill,
         )
+
+        if hs.config.worker.run_background_tasks:
+            self._clock.looping_call(
+                run_as_background_process,
+                DEVICE_FEDERATION_INBOX_CLEANUP_INTERVAL_MS,
+                "_delete_old_federation_inbox_rows",
+                self.server_name,
+                self._delete_old_federation_inbox_rows,
+            )
 
     def process_replication_rows(
         self,
@@ -182,6 +193,9 @@ class DeviceInboxWorkerStore(SQLBaseStore):
     def get_to_device_stream_token(self) -> int:
         return self._to_device_msg_id_gen.get_current_token()
 
+    def get_to_device_id_generator(self) -> MultiWriterIdGenerator:
+        return self._to_device_msg_id_gen
+
     async def get_messages_for_user_devices(
         self,
         user_ids: Collection[str],
@@ -213,9 +227,9 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             to_stream_id=to_stream_id,
         )
 
-        assert (
-            last_processed_stream_id == to_stream_id
-        ), "Expected _get_device_messages to process all to-device messages up to `to_stream_id`"
+        assert last_processed_stream_id == to_stream_id, (
+            "Expected _get_device_messages to process all to-device messages up to `to_stream_id`"
+        )
 
         return user_id_device_id_to_messages
 
@@ -838,14 +852,13 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             # Check if we've already inserted a matching message_id for that
             # origin. This can happen if the origin doesn't receive our
             # acknowledgement from the first time we received the message.
-            already_inserted = self.db_pool.simple_select_one_txn(
+            already_inserted = self.db_pool.simple_select_list_txn(
                 txn,
                 table="device_federation_inbox",
                 keyvalues={"origin": origin, "message_id": message_id},
                 retcols=("message_id",),
-                allow_none=True,
             )
-            if already_inserted is not None:
+            if already_inserted:
                 return
 
             # Add an entry for this message_id so that we know we've processed
@@ -974,10 +987,91 @@ class DeviceInboxWorkerStore(SQLBaseStore):
                 ],
             )
 
+    async def _delete_old_federation_inbox_rows(self, batch_size: int = 1000) -> None:
+        """Delete old rows from the device_federation_inbox table."""
+
+        # We wait until we have the index on `received_ts`, otherwise the query
+        # will take a very long time.
+        if not await self.db_pool.updates.has_completed_background_update(
+            DEVICE_FEDERATION_INBOX_RECEIVED_INDEX_UPDATE
+        ):
+            return
+
+        def _delete_old_federation_inbox_rows_txn(txn: LoggingTransaction) -> bool:
+            # We delete at most 100 rows that are older than
+            # DEVICE_FEDERATION_INBOX_CLEANUP_DELAY_MS
+            delete_before_ts = (
+                self._clock.time_msec() - DEVICE_FEDERATION_INBOX_CLEANUP_DELAY_MS
+            )
+            sql = """
+                WITH to_delete AS (
+                    SELECT origin, message_id
+                    FROM device_federation_inbox
+                    WHERE received_ts < ?
+                    ORDER BY received_ts ASC
+                    LIMIT ?
+                )
+                DELETE FROM device_federation_inbox
+                WHERE
+                    (origin, message_id) IN (
+                        SELECT origin, message_id FROM to_delete
+                    )
+            """
+            txn.execute(sql, (delete_before_ts, batch_size))
+            return txn.rowcount < batch_size
+
+        while True:
+            finished = await self.db_pool.runInteraction(
+                "_delete_old_federation_inbox_rows",
+                _delete_old_federation_inbox_rows_txn,
+                db_autocommit=True,  # We don't need to run in a transaction
+            )
+            if finished:
+                return
+
+            # We sleep a bit so that we don't hammer the database in a tight
+            # loop first time we run this.
+            await self._clock.sleep(1)
+
+    async def get_devices_with_messages(
+        self, user_id: str, device_ids: StrCollection
+    ) -> StrCollection:
+        """Get the matching device IDs that have messages in the device inbox."""
+
+        def get_devices_with_messages_txn(
+            txn: LoggingTransaction,
+            batch_device_ids: StrCollection,
+        ) -> StrCollection:
+            clause, args = make_in_list_sql_clause(
+                self.database_engine, "device_id", batch_device_ids
+            )
+            sql = f"""
+                SELECT DISTINCT device_id FROM device_inbox
+                WHERE {clause} AND user_id = ?
+            """
+            args.append(user_id)
+            txn.execute(sql, args)
+            return {row[0] for row in txn}
+
+        results: Set[str] = set()
+        for batch_device_ids in batch_iter(device_ids, 1000):
+            batch_results = await self.db_pool.runInteraction(
+                "get_devices_with_messages",
+                get_devices_with_messages_txn,
+                batch_device_ids,
+                # We don't need to run in a transaction as it's a single query
+                db_autocommit=True,
+            )
+
+            results.update(batch_results)
+
+        return results
+
 
 class DeviceInboxBackgroundUpdateStore(SQLBaseStore):
     DEVICE_INBOX_STREAM_ID = "device_inbox_stream_drop"
     REMOVE_DEAD_DEVICES_FROM_INBOX = "remove_dead_devices_from_device_inbox"
+    CLEANUP_DEVICE_FEDERATION_OUTBOX = "cleanup_device_federation_outbox"
 
     def __init__(
         self,
@@ -1001,6 +1095,18 @@ class DeviceInboxBackgroundUpdateStore(SQLBaseStore):
         self.db_pool.updates.register_background_update_handler(
             self.REMOVE_DEAD_DEVICES_FROM_INBOX,
             self._remove_dead_devices_from_device_inbox,
+        )
+
+        self.db_pool.updates.register_background_update_handler(
+            self.CLEANUP_DEVICE_FEDERATION_OUTBOX,
+            self._cleanup_device_federation_outbox,
+        )
+
+        self.db_pool.updates.register_background_index_update(
+            update_name=DEVICE_FEDERATION_INBOX_RECEIVED_INDEX_UPDATE,
+            index_name="device_federation_inbox_received_ts_index",
+            table="device_federation_inbox",
+            columns=["received_ts"],
         )
 
     async def _background_drop_index_device_inbox(
@@ -1090,6 +1196,75 @@ class DeviceInboxBackgroundUpdateStore(SQLBaseStore):
         if finished:
             await self.db_pool.updates._end_background_update(
                 self.REMOVE_DEAD_DEVICES_FROM_INBOX,
+            )
+
+        return batch_size
+
+    async def _cleanup_device_federation_outbox(
+        self,
+        progress: JsonDict,
+        batch_size: int,
+    ) -> int:
+        def _cleanup_device_federation_outbox_txn(
+            txn: LoggingTransaction,
+        ) -> bool:
+            if "max_stream_id" in progress:
+                max_stream_id = progress["max_stream_id"]
+            else:
+                txn.execute("SELECT max(stream_id) FROM device_federation_outbox")
+                res = cast(Tuple[Optional[int]], txn.fetchone())
+                if res[0] is None:
+                    # this can only happen if the `device_inbox` table is empty, in which
+                    # case we have no work to do.
+                    return True
+                else:
+                    max_stream_id = res[0]
+
+            start = progress.get("stream_id", 0)
+            stop = start + batch_size
+
+            sql = """
+                SELECT destination FROM device_federation_outbox
+                WHERE ? < stream_id AND stream_id <= ?
+            """
+
+            txn.execute(sql, (start, stop))
+
+            destinations = {d for (d,) in txn}
+            to_remove = set()
+            for d in destinations:
+                try:
+                    parse_and_validate_server_name(d)
+                except ValueError:
+                    to_remove.add(d)
+
+            self.db_pool.simple_delete_many_txn(
+                txn,
+                table="device_federation_outbox",
+                column="destination",
+                values=to_remove,
+                keyvalues={},
+            )
+
+            self.db_pool.updates._background_update_progress_txn(
+                txn,
+                self.CLEANUP_DEVICE_FEDERATION_OUTBOX,
+                {
+                    "stream_id": stop,
+                    "max_stream_id": max_stream_id,
+                },
+            )
+
+            return stop >= max_stream_id
+
+        finished = await self.db_pool.runInteraction(
+            "_cleanup_device_federation_outbox",
+            _cleanup_device_federation_outbox_txn,
+        )
+
+        if finished:
+            await self.db_pool.updates._end_background_update(
+                self.CLEANUP_DEVICE_FEDERATION_OUTBOX,
             )
 
         return batch_size

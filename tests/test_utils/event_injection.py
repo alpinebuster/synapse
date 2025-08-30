@@ -105,6 +105,13 @@ async def create_event(
         builder, prev_event_ids=prev_event_ids
     )
 
+    # Copy over writable internal_metadata, if set
+    # Dev note: This isn't everything that's writable. `for k,v` doesn't work here :(
+    if kwargs.get("internal_metadata", {}).get("soft_failed", False):
+        event.internal_metadata.soft_failed = True
+    if kwargs.get("internal_metadata", {}).get("policy_server_spammy", False):
+        event.internal_metadata.policy_server_spammy = True
+
     context = await unpersisted_context.persist(event)
 
     return event, context
@@ -125,13 +132,15 @@ async def mark_event_as_partial_state(
     in this table).
     """
     store = hs.get_datastores().main
-    await store.db_pool.simple_upsert(
-        table="partial_state_rooms",
-        keyvalues={"room_id": room_id},
-        values={},
-        insertion_values={"room_id": room_id},
+    # Use the store helper to insert into the database so the caches are busted
+    await store.store_partial_state_room(
+        room_id=room_id,
+        servers={hs.hostname},
+        device_lists_stream_id=0,
+        joined_via=hs.hostname,
     )
 
+    # FIXME: Bust the cache
     await store.db_pool.simple_insert(
         table="partial_state_events",
         values={

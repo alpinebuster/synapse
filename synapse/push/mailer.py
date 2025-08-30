@@ -28,10 +28,11 @@ import jinja2
 from markupsafe import Markup
 from prometheus_client import Counter
 
-from synapse.api.constants import EventTypes, Membership, RoomTypes
+from synapse.api.constants import EventContentFields, EventTypes, Membership, RoomTypes
 from synapse.api.errors import StoreError
 from synapse.config.emailconfig import EmailSubjectConfig
 from synapse.events import EventBase
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.push.presentable_names import (
     calculate_room_name,
     descriptor_from_member_events,
@@ -60,7 +61,7 @@ T = TypeVar("T")
 emails_sent_counter = Counter(
     "synapse_emails_sent_total",
     "Emails sent by type",
-    ["type"],
+    labelnames=["type", SERVER_NAME_LABEL],
 )
 
 
@@ -123,6 +124,7 @@ class Mailer:
         template_text: jinja2.Template,
     ):
         self.hs = hs
+        self.server_name = hs.hostname
         self.template_html = template_html
         self.template_text = template_text
 
@@ -135,9 +137,7 @@ class Mailer:
         self.app_name = app_name
         self.email_subjects: EmailSubjectConfig = hs.config.email.email_subjects
 
-        logger.info("Created Mailer for app_name %s" % app_name)
-
-    emails_sent_counter.labels("password_reset")
+        logger.info("Created Mailer for app_name %s", app_name)
 
     async def send_password_reset_mail(
         self, email_address: str, token: str, client_secret: str, sid: str
@@ -162,7 +162,10 @@ class Mailer:
 
         template_vars: TemplateVars = {"link": link}
 
-        emails_sent_counter.labels("password_reset").inc()
+        emails_sent_counter.labels(
+            type="password_reset",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
 
         await self.send_email(
             email_address,
@@ -170,8 +173,6 @@ class Mailer:
             % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
             template_vars,
         )
-
-    emails_sent_counter.labels("registration")
 
     async def send_registration_mail(
         self, email_address: str, token: str, client_secret: str, sid: str
@@ -196,7 +197,10 @@ class Mailer:
 
         template_vars: TemplateVars = {"link": link}
 
-        emails_sent_counter.labels("registration").inc()
+        emails_sent_counter.labels(
+            type="registration",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
 
         await self.send_email(
             email_address,
@@ -205,7 +209,24 @@ class Mailer:
             template_vars,
         )
 
-    emails_sent_counter.labels("add_threepid")
+    async def send_already_in_use_mail(self, email_address: str) -> None:
+        """Send an email if the address is already bound to an user account
+
+        Args:
+            email_address: Email address we're sending to the "already in use" mail
+        """
+
+        emails_sent_counter.labels(
+            type="already_in_use",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
+
+        await self.send_email(
+            email_address,
+            self.email_subjects.email_already_in_use
+            % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
+            {},
+        )
 
     async def send_add_threepid_mail(
         self, email_address: str, token: str, client_secret: str, sid: str
@@ -231,7 +252,10 @@ class Mailer:
 
         template_vars: TemplateVars = {"link": link}
 
-        emails_sent_counter.labels("add_threepid").inc()
+        emails_sent_counter.labels(
+            type="add_threepid",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
 
         await self.send_email(
             email_address,
@@ -239,8 +263,6 @@ class Mailer:
             % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
             template_vars,
         )
-
-    emails_sent_counter.labels("notification")
 
     async def send_notification_mail(
         self,
@@ -336,7 +358,10 @@ class Mailer:
             "reason": reason,
         }
 
-        emails_sent_counter.labels("notification").inc()
+        emails_sent_counter.labels(
+            type="notification",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
 
         await self.send_email(
             email_address, summary_text, template_vars, unsubscribe_link
@@ -513,7 +538,9 @@ class Mailer:
         }
 
         the_events = await filter_events_for_client(
-            self._storage_controllers, user_id, results.events_before
+            self._storage_controllers,
+            user_id,
+            results.events_before,
         )
         the_events.append(notif_event)
 
@@ -698,7 +725,8 @@ class Mailer:
                 )
                 if (
                     create_event
-                    and create_event.content.get("room_type") == RoomTypes.SPACE
+                    and create_event.content.get(EventContentFields.ROOM_TYPE)
+                    == RoomTypes.SPACE
                 ):
                     return self.email_subjects.invite_from_person_to_space % {
                         "person": inviter_name,

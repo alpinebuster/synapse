@@ -21,156 +21,17 @@
 from http import HTTPStatus
 
 from twisted.internet.defer import ensureDeferred
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.api.errors import NotFoundError
-from synapse.rest import admin, devices, room, sync
-from synapse.rest.client import account, keys, login, register
+from synapse.appservice import ApplicationService
+from synapse.rest import admin, devices, sync
+from synapse.rest.client import keys, login, register
 from synapse.server import HomeServer
 from synapse.types import JsonDict, UserID, create_requester
 from synapse.util import Clock
 
 from tests import unittest
-
-
-class DeviceListsTestCase(unittest.HomeserverTestCase):
-    """Tests regarding device list changes."""
-
-    servlets = [
-        admin.register_servlets_for_client_rest_resource,
-        login.register_servlets,
-        register.register_servlets,
-        account.register_servlets,
-        room.register_servlets,
-        sync.register_servlets,
-        devices.register_servlets,
-    ]
-
-    def test_receiving_local_device_list_changes(self) -> None:
-        """Tests that a local users that share a room receive each other's device list
-        changes.
-        """
-        # Register two users
-        test_device_id = "TESTDEVICE"
-        alice_user_id = self.register_user("alice", "correcthorse")
-        alice_access_token = self.login(
-            alice_user_id, "correcthorse", device_id=test_device_id
-        )
-
-        bob_user_id = self.register_user("bob", "ponyponypony")
-        bob_access_token = self.login(bob_user_id, "ponyponypony")
-
-        # Create a room for them to coexist peacefully in
-        new_room_id = self.helper.create_room_as(
-            alice_user_id, is_public=True, tok=alice_access_token
-        )
-        self.assertIsNotNone(new_room_id)
-
-        # Have Bob join the room
-        self.helper.invite(
-            new_room_id, alice_user_id, bob_user_id, tok=alice_access_token
-        )
-        self.helper.join(new_room_id, bob_user_id, tok=bob_access_token)
-
-        # Now have Bob initiate an initial sync (in order to get a since token)
-        channel = self.make_request(
-            "GET",
-            "/sync",
-            access_token=bob_access_token,
-        )
-        self.assertEqual(channel.code, 200, channel.json_body)
-        next_batch_token = channel.json_body["next_batch"]
-
-        # ...and then an incremental sync. This should block until the sync stream is woken up,
-        # which we hope will happen as a result of Alice updating their device list.
-        bob_sync_channel = self.make_request(
-            "GET",
-            f"/sync?since={next_batch_token}&timeout=30000",
-            access_token=bob_access_token,
-            # Start the request, then continue on.
-            await_result=False,
-        )
-
-        # Have alice update their device list
-        channel = self.make_request(
-            "PUT",
-            f"/devices/{test_device_id}",
-            {
-                "display_name": "New Device Name",
-            },
-            access_token=alice_access_token,
-        )
-        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
-
-        # Check that bob's incremental sync contains the updated device list.
-        # If not, the client would only receive the device list update on the
-        # *next* sync.
-        bob_sync_channel.await_result()
-        self.assertEqual(bob_sync_channel.code, 200, bob_sync_channel.json_body)
-
-        changed_device_lists = bob_sync_channel.json_body.get("device_lists", {}).get(
-            "changed", []
-        )
-        self.assertIn(alice_user_id, changed_device_lists, bob_sync_channel.json_body)
-
-    def test_not_receiving_local_device_list_changes(self) -> None:
-        """Tests a local users DO NOT receive device updates from each other if they do not
-        share a room.
-        """
-        # Register two users
-        test_device_id = "TESTDEVICE"
-        alice_user_id = self.register_user("alice", "correcthorse")
-        alice_access_token = self.login(
-            alice_user_id, "correcthorse", device_id=test_device_id
-        )
-
-        bob_user_id = self.register_user("bob", "ponyponypony")
-        bob_access_token = self.login(bob_user_id, "ponyponypony")
-
-        # These users do not share a room. They are lonely.
-
-        # Have Bob initiate an initial sync (in order to get a since token)
-        channel = self.make_request(
-            "GET",
-            "/sync",
-            access_token=bob_access_token,
-        )
-        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
-        next_batch_token = channel.json_body["next_batch"]
-
-        # ...and then an incremental sync. This should block until the sync stream is woken up,
-        # which we hope will happen as a result of Alice updating their device list.
-        bob_sync_channel = self.make_request(
-            "GET",
-            f"/sync?since={next_batch_token}&timeout=1000",
-            access_token=bob_access_token,
-            # Start the request, then continue on.
-            await_result=False,
-        )
-
-        # Have alice update their device list
-        channel = self.make_request(
-            "PUT",
-            f"/devices/{test_device_id}",
-            {
-                "display_name": "New Device Name",
-            },
-            access_token=alice_access_token,
-        )
-        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
-
-        # Check that bob's incremental sync does not contain the updated device list.
-        bob_sync_channel.await_result()
-        self.assertEqual(
-            bob_sync_channel.code, HTTPStatus.OK, bob_sync_channel.json_body
-        )
-
-        changed_device_lists = bob_sync_channel.json_body.get("device_lists", {}).get(
-            "changed", []
-        )
-        self.assertNotIn(
-            alice_user_id, changed_device_lists, bob_sync_channel.json_body
-        )
 
 
 class DevicesTestCase(unittest.HomeserverTestCase):
@@ -595,3 +456,183 @@ class DehydratedDeviceTestCase(unittest.HomeserverTestCase):
             token,
         )
         self.assertEqual(channel.json_body["device_keys"], {"@mikey:test": {}})
+
+
+class MSC4190AppserviceDevicesTestCase(unittest.HomeserverTestCase):
+    servlets = [
+        register.register_servlets,
+        devices.register_servlets,
+    ]
+
+    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
+        self.hs = self.setup_test_homeserver()
+
+        # This application service uses the new MSC4190 behaviours
+        self.msc4190_service = ApplicationService(
+            id="msc4190",
+            token="some_token",
+            hs_token="some_token",
+            sender=UserID.from_string("@as:example.com"),
+            namespaces={
+                ApplicationService.NS_USERS: [{"regex": "@.*", "exclusive": False}]
+            },
+            msc4190_device_management=True,
+        )
+        # This application service doesn't use the new MSC4190 behaviours
+        self.pre_msc_service = ApplicationService(
+            id="regular",
+            token="other_token",
+            hs_token="other_token",
+            sender=UserID.from_string("@as2:example.com"),
+            namespaces={
+                ApplicationService.NS_USERS: [{"regex": "@.*", "exclusive": False}]
+            },
+            msc4190_device_management=False,
+        )
+        self.hs.get_datastores().main.services_cache.append(self.msc4190_service)
+        self.hs.get_datastores().main.services_cache.append(self.pre_msc_service)
+        return self.hs
+
+    def test_PUT_device(self) -> None:
+        self.register_appservice_user("alice", self.msc4190_service.token)
+        self.register_appservice_user("bob", self.pre_msc_service.token)
+
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(channel.json_body, {"devices": []})
+
+        channel = self.make_request(
+            "PUT",
+            "/_matrix/client/v3/devices/AABBCCDD?user_id=@alice:test",
+            content={"display_name": "Alice's device"},
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 201, channel.json_body)
+
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(len(channel.json_body["devices"]), 1)
+        self.assertEqual(channel.json_body["devices"][0]["device_id"], "AABBCCDD")
+
+        # Doing a second time should return a 200 instead of a 201
+        channel = self.make_request(
+            "PUT",
+            "/_matrix/client/v3/devices/AABBCCDD?user_id=@alice:test",
+            content={"display_name": "Alice's device"},
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+
+        # On the regular service, that API should not allow for the
+        # creation of new devices.
+        channel = self.make_request(
+            "PUT",
+            "/_matrix/client/v3/devices/AABBCCDD?user_id=@bob:test",
+            content={"display_name": "Bob's device"},
+            access_token=self.pre_msc_service.token,
+        )
+        self.assertEqual(channel.code, 404, channel.json_body)
+
+    def test_DELETE_device(self) -> None:
+        self.register_appservice_user("alice", self.msc4190_service.token)
+
+        # There should be no device
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(channel.json_body, {"devices": []})
+
+        # Create a device
+        channel = self.make_request(
+            "PUT",
+            "/_matrix/client/v3/devices/AABBCCDD?user_id=@alice:test",
+            content={},
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 201, channel.json_body)
+
+        # There should be one device
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(len(channel.json_body["devices"]), 1)
+
+        # Delete the device. UIA should not be required.
+        channel = self.make_request(
+            "DELETE",
+            "/_matrix/client/v3/devices/AABBCCDD?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+
+        # There should be no device again
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(channel.json_body, {"devices": []})
+
+    def test_POST_delete_devices(self) -> None:
+        self.register_appservice_user("alice", self.msc4190_service.token)
+
+        # There should be no device
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(channel.json_body, {"devices": []})
+
+        # Create a device
+        channel = self.make_request(
+            "PUT",
+            "/_matrix/client/v3/devices/AABBCCDD?user_id=@alice:test",
+            content={},
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 201, channel.json_body)
+
+        # There should be one device
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(len(channel.json_body["devices"]), 1)
+
+        # Delete the device with delete_devices
+        # UIA should not be required.
+        channel = self.make_request(
+            "POST",
+            "/_matrix/client/v3/delete_devices?user_id=@alice:test",
+            content={"devices": ["AABBCCDD"]},
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+
+        # There should be no device again
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/v3/devices?user_id=@alice:test",
+            access_token=self.msc4190_service.token,
+        )
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(channel.json_body, {"devices": []})

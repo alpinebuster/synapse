@@ -48,6 +48,7 @@ from synapse.storage.databases.main.events_worker import InvalidEventError
 from synapse.storage.databases.main.state_deltas import StateDeltasStore
 from synapse.types import JsonDict
 from synapse.util.caches.descriptors import cached
+from synapse.util.events import get_plain_text_topic_from_event_content
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -161,7 +162,7 @@ class StatsStore(StateDeltasStore):
                     LIMIT ?
                 """
             txn.execute(sql, (last_user_id, batch_size))
-            return [r for r, in txn]
+            return [r for (r,) in txn]
 
         users_to_work_on = await self.db_pool.runInteraction(
             "_populate_stats_process_users", _get_next_batch
@@ -207,7 +208,7 @@ class StatsStore(StateDeltasStore):
                     LIMIT ?
                 """
             txn.execute(sql, (last_room_id, batch_size))
-            return [r for r, in txn]
+            return [r for (r,) in txn]
 
         rooms_to_work_on = await self.db_pool.runInteraction(
             "populate_stats_rooms_get_batch", _get_next_batch
@@ -611,7 +612,9 @@ class StatsStore(StateDeltasStore):
             elif event.type == EventTypes.Name:
                 room_state["name"] = event.content.get("name")
             elif event.type == EventTypes.Topic:
-                room_state["topic"] = event.content.get("topic")
+                room_state["topic"] = get_plain_text_topic_from_event_content(
+                    event.content
+                )
             elif event.type == EventTypes.RoomAvatar:
                 room_state["avatar"] = event.content.get("url")
             elif event.type == EventTypes.CanonicalAlias:
@@ -751,9 +754,7 @@ class StatsStore(StateDeltasStore):
                 LEFT JOIN profiles AS p ON lmr.user_id = p.full_user_id
                 {}
                 GROUP BY lmr.user_id, displayname
-            """.format(
-                where_clause
-            )
+            """.format(where_clause)
 
             # SQLite does not support SELECT COUNT(*) OVER()
             sql = """

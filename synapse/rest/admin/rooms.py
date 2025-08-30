@@ -21,9 +21,9 @@
 import logging
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, cast
-from urllib import parse as urlparse
 
 import attr
+from immutabledict import immutabledict
 
 from synapse.api.constants import Direction, EventTypes, JoinRules, Membership
 from synapse.api.errors import AuthError, Codes, NotFoundError, SynapseError
@@ -36,8 +36,10 @@ from synapse.http.servlet import (
     ResolveRoomIdMixin,
     RestServlet,
     assert_params_in_dict,
+    parse_boolean,
     parse_enum,
     parse_integer,
+    parse_json,
     parse_json_object_from_request,
     parse_string,
 )
@@ -51,7 +53,6 @@ from synapse.storage.databases.main.room import RoomSortOrder
 from synapse.streams.config import PaginationConfig
 from synapse.types import JsonDict, RoomID, ScheduledTask, UserID, create_requester
 from synapse.types.state import StateFilter
-from synapse.util import json_decoder
 
 if TYPE_CHECKING:
     from synapse.api.auth import Auth
@@ -149,6 +150,7 @@ class RoomRestV2Servlet(RestServlet):
 def _convert_delete_task_to_response(task: ScheduledTask) -> JsonDict:
     return {
         "delete_id": task.id,
+        "room_id": task.resource_id,
         "status": task.status,
         "shutdown_room": task.result,
     }
@@ -243,13 +245,23 @@ class ListRoomRestServlet(RestServlet):
                 errcode=Codes.INVALID_PARAM,
             )
 
+        public_rooms = parse_boolean(request, "public_rooms")
+        empty_rooms = parse_boolean(request, "empty_rooms")
+
         direction = parse_enum(request, "dir", Direction, default=Direction.FORWARDS)
         reverse_order = True if direction == Direction.BACKWARDS else False
 
         # Return list of rooms according to parameters
         rooms, total_rooms = await self.store.get_rooms_paginate(
-            start, limit, order_by, reverse_order, search_term
+            start,
+            limit,
+            order_by,
+            reverse_order,
+            search_term,
+            public_rooms,
+            empty_rooms,
         )
+
         response = {
             # next_token should be opaque, so return a value the client can parse
             "offset": start,
@@ -453,7 +465,18 @@ class RoomStateRestServlet(RestServlet):
         if not room:
             raise NotFoundError("Room not found")
 
-        event_ids = await self._storage_controllers.state.get_current_state_ids(room_id)
+        state_filter = None
+        type = parse_string(request, "type")
+
+        if type:
+            state_filter = StateFilter(
+                types=immutabledict({type: None}),
+                include_others=False,
+            )
+
+        event_ids = await self._storage_controllers.state.get_current_state_ids(
+            room_id, state_filter
+        )
         events = await self.store.get_events(event_ids.values())
         now = self.clock.time_msec()
         room_state = await self._event_serializer.serialize_events(events.values(), now)
@@ -604,6 +627,15 @@ class MakeRoomAdminRestServlet(ResolveRoomIdMixin, RestServlet):
             ]
             admin_users.sort(key=lambda user: user_power[user])
 
+            if create_event.room_version.msc4289_creator_power_enabled:
+                creators = create_event.content.get("additional_creators", []) + [
+                    create_event.sender
+                ]
+                for creator in creators:
+                    if self.is_mine_id(creator):
+                        # include the creator as they won't be in the PL users map.
+                        admin_users.append(creator)
+
             if not admin_users:
                 raise SynapseError(
                     HTTPStatus.BAD_REQUEST, "No local admin user in room"
@@ -643,7 +675,11 @@ class MakeRoomAdminRestServlet(ResolveRoomIdMixin, RestServlet):
         # updated power level event.
         new_pl_content = dict(pl_content)
         new_pl_content["users"] = dict(pl_content.get("users", {}))
-        new_pl_content["users"][user_to_add] = new_pl_content["users"][admin_user_id]
+        # give the new user the same PL as the admin, default to 100 in case there is no PL event.
+        # This means in v12+ rooms we get PL100 if the creator promotes us.
+        new_pl_content["users"][user_to_add] = new_pl_content["users"].get(
+            admin_user_id, 100
+        )
 
         fake_requester = create_requester(
             admin_user_id,
@@ -776,14 +812,8 @@ class RoomEventContextServlet(RestServlet):
         limit = parse_integer(request, "limit", default=10)
 
         # picking the API shape for symmetry with /messages
-        filter_str = parse_string(request, "filter", encoding="utf-8")
-        if filter_str:
-            filter_json = urlparse.unquote(filter_str)
-            event_filter: Optional[Filter] = Filter(
-                self._hs, json_decoder.decode(filter_json)
-            )
-        else:
-            event_filter = None
+        filter_json = parse_json(request, "filter", encoding="utf-8")
+        event_filter = Filter(self._hs, filter_json) if filter_json else None
 
         event_context = await self.room_context_handler.get_event_context(
             requester,
@@ -914,21 +944,16 @@ class RoomMessagesRestServlet(RestServlet):
         )
         # Twisted will have processed the args by now.
         assert request.args is not None
+
+        filter_json = parse_json(request, "filter", encoding="utf-8")
+        event_filter = Filter(self._hs, filter_json) if filter_json else None
+
         as_client_event = b"raw" not in request.args
-        filter_str = parse_string(request, "filter", encoding="utf-8")
-        if filter_str:
-            filter_json = urlparse.unquote(filter_str)
-            event_filter: Optional[Filter] = Filter(
-                self._hs, json_decoder.decode(filter_json)
-            )
-            if (
-                event_filter
-                and event_filter.filter_json.get("event_format", "client")
-                == "federation"
-            ):
-                as_client_event = False
-        else:
-            event_filter = None
+        if (
+            event_filter
+            and event_filter.filter_json.get("event_format", "client") == "federation"
+        ):
+            as_client_event = False
 
         msgs = await self._pagination_handler.get_messages(
             room_id=room_id,

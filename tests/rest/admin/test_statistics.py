@@ -21,7 +21,7 @@
 #
 from typing import Dict, List, Optional
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 from twisted.web.resource import Resource
 
 import synapse.rest.admin
@@ -82,7 +82,7 @@ class UserMediaStatisticsTestCase(unittest.HomeserverTestCase):
         """
         If parameters are invalid, an error is returned.
         """
-        # unkown order_by
+        # unknown order_by
         channel = self.make_request(
             "GET",
             self.url + "?order_by=bar",

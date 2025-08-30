@@ -45,7 +45,7 @@ from synapse.storage.util.partial_state_events_tracker import (
     PartialStateEventsTracker,
 )
 from synapse.synapse_rust.acl import ServerAclEvaluator
-from synapse.types import MutableStateMap, StateMap, get_domain_from_id
+from synapse.types import MutableStateMap, StateMap, StreamToken, get_domain_from_id
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches import intern_string
@@ -68,6 +68,7 @@ class StateStorageController:
     """
 
     def __init__(self, hs: "HomeServer", stores: "Databases"):
+        self.server_name = hs.hostname  # nb must be called this for @cached
         self._is_mine_id = hs.is_mine_id
         self._clock = hs.get_clock()
         self.stores = stores
@@ -234,8 +235,11 @@ class StateStorageController:
             RuntimeError if we don't have a state group for one or more of the events
                (ie they are outliers or unknown)
         """
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
         await_full_state = True
-        if state_filter and not state_filter.must_await_full_state(self._is_mine_id):
+        if not state_filter.must_await_full_state(self._is_mine_id):
             await_full_state = False
 
         event_to_groups = await self.get_state_group_for_events(
@@ -244,7 +248,7 @@ class StateStorageController:
 
         groups = set(event_to_groups.values())
         group_to_state = await self.stores.state._get_state_for_groups(
-            groups, state_filter or StateFilter.all()
+            groups, state_filter
         )
 
         state_event_map = await self.stores.main.get_events(
@@ -292,10 +296,11 @@ class StateStorageController:
             RuntimeError if we don't have a state group for one or more of the events
                 (ie they are outliers or unknown)
         """
-        if (
-            await_full_state
-            and state_filter
-            and not state_filter.must_await_full_state(self._is_mine_id)
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
+        if await_full_state and not state_filter.must_await_full_state(
+            self._is_mine_id
         ):
             # Full state is not required if the state filter is restrictive enough.
             await_full_state = False
@@ -306,7 +311,7 @@ class StateStorageController:
 
         groups = set(event_to_groups.values())
         group_to_state = await self.stores.state._get_state_for_groups(
-            groups, state_filter or StateFilter.all()
+            groups, state_filter
         )
 
         event_to_state = {
@@ -335,9 +340,10 @@ class StateStorageController:
             RuntimeError if we don't have a state group for the event (ie it is an
                 outlier or is unknown)
         """
-        state_map = await self.get_state_for_events(
-            [event_id], state_filter or StateFilter.all()
-        )
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
+        state_map = await self.get_state_for_events([event_id], state_filter)
         return state_map[event_id]
 
     @trace
@@ -365,12 +371,133 @@ class StateStorageController:
             RuntimeError if we don't have a state group for the event (ie it is an
                 outlier or is unknown)
         """
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
         state_map = await self.get_state_ids_for_events(
             [event_id],
-            state_filter or StateFilter.all(),
+            state_filter,
             await_full_state=await_full_state,
         )
         return state_map[event_id]
+
+    async def get_state_after_event(
+        self,
+        event_id: str,
+        state_filter: Optional[StateFilter] = None,
+        await_full_state: bool = True,
+    ) -> StateMap[str]:
+        """
+        Get the room state after the given event
+
+        Args:
+            event_id: event of interest
+            state_filter: The state filter used to fetch state from the database.
+            await_full_state: if `True`, will block if we do not yet have complete state
+                at the event and `state_filter` is not satisfied by partial state.
+                Defaults to `True`.
+        """
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
+        state_ids = await self.get_state_ids_for_event(
+            event_id,
+            state_filter=state_filter,
+            await_full_state=await_full_state,
+        )
+
+        # using get_metadata_for_events here (instead of get_event) sidesteps an issue
+        # with redactions: if `event_id` is a redaction event, and we don't have the
+        # original (possibly because it got purged), get_event will refuse to return
+        # the redaction event, which isn't terribly helpful here.
+        #
+        # (To be fair, in that case we could assume it's *not* a state event, and
+        # therefore we don't need to worry about it. But still, it seems cleaner just
+        # to pull the metadata.)
+        m = (await self.stores.main.get_metadata_for_events([event_id]))[event_id]
+        if m.state_key is not None and m.rejection_reason is None:
+            state_ids = dict(state_ids)
+            state_ids[(m.event_type, m.state_key)] = event_id
+
+        return state_ids
+
+    async def get_state_ids_at(
+        self,
+        room_id: str,
+        stream_position: StreamToken,
+        state_filter: Optional[StateFilter] = None,
+        await_full_state: bool = True,
+    ) -> StateMap[str]:
+        """Get the room state at a particular stream position
+
+        Args:
+            room_id: room for which to get state
+            stream_position: point at which to get state
+            state_filter: The state filter used to fetch state from the database.
+            await_full_state: if `True`, will block if we do not yet have complete state
+                at the last event in the room before `stream_position` and
+                `state_filter` is not satisfied by partial state. Defaults to `True`.
+        """
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
+        # FIXME: This gets the state at the latest event before the stream ordering,
+        # which might not be the same as the "current state" of the room at the time
+        # of the stream token if there were multiple forward extremities at the time.
+        last_event_id = (
+            await self.stores.main.get_last_event_id_in_room_before_stream_ordering(
+                room_id,
+                end_token=stream_position.room_key,
+            )
+        )
+
+        # FIXME: This will return incorrect results when there are timeline gaps. For
+        # example, when you try to get a point in the room we haven't backfilled before.
+
+        if last_event_id:
+            state = await self.get_state_after_event(
+                last_event_id,
+                state_filter=state_filter,
+                await_full_state=await_full_state,
+            )
+
+        else:
+            # no events in this room - so presumably no state
+            state = {}
+
+            # (erikj) This should be rarely hit, but we've had some reports that
+            # we get more state down gappy syncs than we should, so let's add
+            # some logging.
+            logger.info(
+                "Failed to find any events in room %s at %s",
+                room_id,
+                stream_position.room_key,
+            )
+        return state
+
+    @trace
+    @tag_args
+    async def get_state_at(
+        self,
+        room_id: str,
+        stream_position: StreamToken,
+        state_filter: Optional[StateFilter] = None,
+        await_full_state: bool = True,
+    ) -> StateMap[EventBase]:
+        """Same as `get_state_ids_at` but also fetches the events"""
+        state_map_ids = await self.get_state_ids_at(
+            room_id, stream_position, state_filter, await_full_state
+        )
+
+        event_map = await self.stores.main.get_events(list(state_map_ids.values()))
+
+        state_map = {}
+        for key, event_id in state_map_ids.items():
+            event = event_map.get(event_id)
+            if event:
+                state_map[key] = event
+
+        return state_map
 
     @trace
     @tag_args
@@ -388,9 +515,10 @@ class StateStorageController:
         Returns:
             Dict of state group to state map.
         """
-        return await self.stores.state._get_state_for_groups(
-            groups, state_filter or StateFilter.all()
-        )
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
+        return await self.stores.state._get_state_for_groups(groups, state_filter)
 
     @trace
     @tag_args
@@ -471,12 +599,13 @@ class StateStorageController:
         Returns:
             The current state of the room.
         """
-        if await_full_state and (
-            not state_filter or state_filter.must_await_full_state(self._is_mine_id)
-        ):
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
+        if await_full_state and state_filter.must_await_full_state(self._is_mine_id):
             await self._partial_state_room_tracker.await_full_state(room_id)
 
-        if state_filter and not state_filter.is_full():
+        if state_filter is not None and not state_filter.is_full():
             return await self.stores.main.get_partial_filtered_current_state_ids(
                 room_id, state_filter
             )
@@ -684,7 +813,9 @@ class StateStorageController:
             state_group = object()
 
         assert state_group is not None
-        with Measure(self._clock, "get_joined_hosts"):
+        with Measure(
+            self._clock, name="get_joined_hosts", server_name=self.server_name
+        ):
             return await self._get_joined_hosts(
                 room_id, state_group, state_entry=state_entry
             )

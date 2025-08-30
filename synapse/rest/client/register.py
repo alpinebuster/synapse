@@ -56,7 +56,7 @@ from synapse.http.servlet import (
     parse_string,
 )
 from synapse.http.site import SynapseRequest
-from synapse.metrics import threepid_send_requests
+from synapse.metrics import SERVER_NAME_LABEL, threepid_send_requests
 from synapse.push.mailer import Mailer
 from synapse.types import JsonDict
 from synapse.util.msisdn import phone_number_to_msisdn
@@ -82,15 +82,22 @@ class EmailRegisterRequestTokenRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.hs = hs
+        self.server_name = hs.hostname
         self.identity_handler = hs.get_identity_handler()
         self.config = hs.config
 
         if self.hs.config.email.can_verify_email:
-            self.mailer = Mailer(
+            self.registration_mailer = Mailer(
                 hs=self.hs,
                 app_name=self.config.email.email_app_name,
                 template_html=self.config.email.email_registration_template_html,
                 template_text=self.config.email.email_registration_template_text,
+            )
+            self.already_in_use_mailer = Mailer(
+                hs=self.hs,
+                app_name=self.config.email.email_app_name,
+                template_html=self.config.email.email_already_in_use_template_html,
+                template_text=self.config.email.email_already_in_use_template_text,
             )
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
@@ -139,8 +146,10 @@ class EmailRegisterRequestTokenRestServlet(RestServlet):
             if self.hs.config.server.request_token_inhibit_3pid_errors:
                 # Make the client think the operation succeeded. See the rationale in the
                 # comments for request_token_inhibit_3pid_errors.
+                # Still send an email to warn the user that an account already exists.
                 # Also wait for some random amount of time between 100ms and 1s to make it
                 # look like we did something.
+                await self.already_in_use_mailer.send_already_in_use_mail(email)
                 await self.hs.get_clock().sleep(random.randint(1, 10) / 10)
                 return 200, {"sid": random_string(16)}
 
@@ -151,13 +160,15 @@ class EmailRegisterRequestTokenRestServlet(RestServlet):
             email,
             client_secret,
             send_attempt,
-            self.mailer.send_registration_mail,
+            self.registration_mailer.send_registration_mail,
             next_link,
         )
 
-        threepid_send_requests.labels(type="email", reason="register").observe(
-            send_attempt
-        )
+        threepid_send_requests.labels(
+            type="email",
+            reason="register",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).observe(send_attempt)
 
         # Wrap the session id in a JSON object
         return 200, {"sid": sid}
@@ -169,6 +180,7 @@ class MsisdnRegisterRequestTokenRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.hs = hs
+        self.server_name = hs.hostname
         self.identity_handler = hs.get_identity_handler()
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
@@ -232,9 +244,11 @@ class MsisdnRegisterRequestTokenRestServlet(RestServlet):
             next_link,
         )
 
-        threepid_send_requests.labels(type="msisdn", reason="register").observe(
-            send_attempt
-        )
+        threepid_send_requests.labels(
+            type="msisdn",
+            reason="register",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).observe(send_attempt)
 
         return 200, ret
 
@@ -315,10 +329,12 @@ class UsernameAvailabilityRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self.hs = hs
+        self.server_name = hs.hostname
         self.registration_handler = hs.get_registration_handler()
         self.ratelimiter = FederationRateLimiter(
-            hs.get_clock(),
-            FederationRatelimitSettings(
+            our_server_name=self.server_name,
+            clock=hs.get_clock(),
+            config=FederationRatelimitSettings(
                 # Time window of 2s
                 window_size=2000,
                 # Artificially delay requests if rate > sleep_limit/window_size
@@ -632,12 +648,10 @@ class RegisterRestServlet(RestServlet):
             if not password_hash:
                 raise SynapseError(400, "Missing params: password", Codes.MISSING_PARAM)
 
-            desired_username = (
-                await (
-                    self.password_auth_provider.get_username_for_registration(
-                        auth_result,
-                        params,
-                    )
+            desired_username = await (
+                self.password_auth_provider.get_username_for_registration(
+                    auth_result,
+                    params,
                 )
             )
 
@@ -688,11 +702,9 @@ class RegisterRestServlet(RestServlet):
                 session_id
             )
 
-            display_name = (
-                await (
-                    self.password_auth_provider.get_displayname_for_registration(
-                        auth_result, params
-                    )
+            display_name = await (
+                self.password_auth_provider.get_displayname_for_registration(
+                    auth_result, params
                 )
             )
 
@@ -767,9 +779,12 @@ class RegisterRestServlet(RestServlet):
         body: JsonDict,
         should_issue_refresh_token: bool = False,
     ) -> JsonDict:
-        user_id = await self.registration_handler.appservice_register(
+        user_id, appservice = await self.registration_handler.appservice_register(
             username, as_token
         )
+        if appservice.msc4190_device_management:
+            body["inhibit_login"] = True
+
         return await self._create_registration_details(
             user_id,
             body,
@@ -901,6 +916,14 @@ class RegisterAppServiceOnlyRestServlet(RestServlet):
 
         await self.ratelimiter.ratelimit(None, client_addr, update=False)
 
+        # Allow only ASes to use this API.
+        if body.get("type") != APP_SERVICE_REGISTRATION_TYPE:
+            raise SynapseError(
+                403,
+                "Registration has been disabled. Only m.login.application_service registrations are allowed.",
+                errcode=Codes.FORBIDDEN,
+            )
+
         kind = parse_string(request, "kind", default="user")
 
         if kind == "guest":
@@ -916,10 +939,6 @@ class RegisterAppServiceOnlyRestServlet(RestServlet):
         if not isinstance(desired_username, str) or len(desired_username) > 512:
             raise SynapseError(400, "Invalid username")
 
-        # Allow only ASes to use this API.
-        if body.get("type") != APP_SERVICE_REGISTRATION_TYPE:
-            raise SynapseError(403, "Non-application service registration type")
-
         if not self.auth.has_access_token(request):
             raise SynapseError(
                 400,
@@ -933,7 +952,7 @@ class RegisterAppServiceOnlyRestServlet(RestServlet):
 
         as_token = self.auth.get_access_token_from_request(request)
 
-        user_id = await self.registration_handler.appservice_register(
+        user_id, _ = await self.registration_handler.appservice_register(
             desired_username, as_token
         )
         return 200, {"user_id": user_id}
@@ -1025,7 +1044,7 @@ def _calculate_registration_flows(
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
-    if hs.config.experimental.msc3861.enabled:
+    if hs.config.mas.enabled or hs.config.experimental.msc3861.enabled:
         RegisterAppServiceOnlyRestServlet(hs).register(http_server)
         return
 

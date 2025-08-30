@@ -58,6 +58,7 @@ import twisted
 from twisted.enterprise import adbapi
 from twisted.internet import address, tcp, threads, udp
 from twisted.internet._resolver import SimpleResolverComplexifier
+from twisted.internet.address import IPv4Address, IPv6Address
 from twisted.internet.defer import Deferred, fail, maybeDeferred, succeed
 from twisted.internet.error import DNSLookupError
 from twisted.internet.interfaces import (
@@ -73,18 +74,20 @@ from twisted.internet.interfaces import (
     IReactorPluggableNameResolver,
     IReactorTime,
     IResolverSimple,
+    ITCPTransport,
     ITransport,
 )
 from twisted.internet.protocol import ClientFactory, DatagramProtocol, Factory
+from twisted.internet.testing import AccumulatingProtocol, MemoryReactorClock
 from twisted.python import threadpool
 from twisted.python.failure import Failure
-from twisted.test.proto_helpers import AccumulatingProtocol, MemoryReactorClock
 from twisted.web.http_headers import Headers
 from twisted.web.resource import IResource
 from twisted.web.server import Request, Site
 
 from synapse.config.database import DatabaseConnectionConfig
 from synapse.config.homeserver import HomeServerConfig
+from synapse.events.auto_accept_invites import InviteAutoAccepter
 from synapse.events.presence_router import load_legacy_presence_router
 from synapse.handlers.auth import load_legacy_password_auth_providers
 from synapse.http.site import SynapseRequest
@@ -94,6 +97,7 @@ from synapse.module_api.callbacks.third_party_event_rules_callbacks import (
     load_legacy_third_party_event_rules,
 )
 from synapse.server import HomeServer
+from synapse.server_notices.consent_server_notices import ConfigError
 from synapse.storage import DataStore
 from synapse.storage.database import LoggingDatabaseConnection, make_pool
 from synapse.storage.engines import BaseDatabaseEngine, create_engine
@@ -197,17 +201,35 @@ class FakeChannel:
     def headers(self) -> Headers:
         if not self.result:
             raise Exception("No result yet.")
-        h = Headers()
-        for i in self.result["headers"]:
-            h.addRawHeader(*i)
+
+        h = self.result["headers"]
+        assert isinstance(h, Headers)
         return h
 
     def writeHeaders(
-        self, version: bytes, code: bytes, reason: bytes, headers: Headers
+        self,
+        version: bytes,
+        code: bytes,
+        reason: bytes,
+        headers: Union[Headers, List[Tuple[bytes, bytes]]],
     ) -> None:
         self.result["version"] = version
         self.result["code"] = code
         self.result["reason"] = reason
+
+        if isinstance(headers, list):
+            # Support prior to Twisted 24.7.0rc1
+            new_headers = Headers()
+            for k, v in headers:
+                assert isinstance(k, bytes), f"key is not of type bytes: {k!r}"
+                assert isinstance(v, bytes), f"value is not of type bytes: {v!r}"
+                new_headers.addRawHeader(k, v)
+            headers = new_headers
+
+        assert isinstance(headers, Headers), (
+            f"headers are of the wrong type: {headers!r}"
+        )
+
         self.result["headers"] = headers
 
     def write(self, data: bytes) -> None:
@@ -288,10 +310,6 @@ class FakeChannel:
         self._reactor.run()
 
         while not self.is_finished():
-            # If there's a producer, tell it to resume producing so we get content
-            if self._producer:
-                self._producer.resumeProducing()
-
             if self._reactor.seconds() > end_time:
                 raise TimedOutException("Timed out waiting for request to finish.")
 
@@ -326,7 +344,8 @@ class FakeSite:
         self,
         resource: IResource,
         reactor: IReactorTime,
-        experimental_cors_msc3886: bool = False,
+        *,
+        parsePOSTFormSubmission: bool = True,
     ):
         """
 
@@ -335,7 +354,7 @@ class FakeSite:
         """
         self._resource = resource
         self.reactor = reactor
-        self.experimental_cors_msc3886 = experimental_cors_msc3886
+        self._parsePOSTFormSubmission = parsePOSTFormSubmission
 
     def getResourceFor(self, request: Request) -> IResource:
         return self._resource
@@ -351,6 +370,7 @@ def make_request(
     request: Type[Request] = SynapseRequest,
     shorthand: bool = True,
     federation_auth_origin: Optional[bytes] = None,
+    content_type: Optional[bytes] = None,
     content_is_form: bool = False,
     await_result: bool = True,
     custom_headers: Optional[Iterable[CustomHeaderType]] = None,
@@ -373,6 +393,8 @@ def make_request(
             with the usual REST API path, if it doesn't contain it.
         federation_auth_origin: if set to not-None, we will add a fake
             Authorization header pretenting to be the given server name.
+        content_type: The content-type to use for the request. If not set then will default to
+            application/json unless content_is_form is true.
         content_is_form: Whether the content is URL encoded form data. Adds the
             'Content-Type': 'application/x-www-form-urlencoded' header.
         await_result: whether to wait for the request to complete rendering. If true,
@@ -411,7 +433,7 @@ def make_request(
 
     channel = FakeChannel(site, reactor, ip=client_ip)
 
-    req = request(channel, site)
+    req = request(channel, site, our_server_name="test_server")
     channel.request = req
 
     req.content = BytesIO(content)
@@ -436,7 +458,9 @@ def make_request(
         )
 
     if content:
-        if content_is_form:
+        if content_type is not None:
+            req.requestHeaders.addRawHeader(b"Content-Type", content_type)
+        elif content_is_form:
             req.requestHeaders.addRawHeader(
                 b"Content-Type", b"application/x-www-form-urlencoded"
             )
@@ -494,8 +518,12 @@ class ThreadedMemoryReactorClock(MemoryReactorClock):
 
             tls._get_default_clock = lambda: self
 
-        self.nameResolver = SimpleResolverComplexifier(FakeResolver())
         super().__init__()
+
+        # Override the default name resolver with our fake resolver. This must
+        # happen after `super().__init__()` so that the base class doesn't
+        # overwrite it again.
+        self.nameResolver = SimpleResolverComplexifier(FakeResolver())
 
     def installNameResolver(self, resolver: IHostnameResolver) -> IHostnameResolver:
         raise NotImplementedError()
@@ -675,6 +703,7 @@ def make_fake_db_pool(
     reactor: ISynapseReactor,
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
+    server_name: str,
 ) -> adbapi.ConnectionPool:
     """Wrapper for `make_pool` which builds a pool which runs db queries synchronously.
 
@@ -683,7 +712,9 @@ def make_fake_db_pool(
     is a drop-in replacement for the normal `make_pool` which builds such a connection
     pool.
     """
-    pool = make_pool(reactor, db_config, engine)
+    pool = make_pool(
+        reactor=reactor, db_config=db_config, engine=engine, server_name=server_name
+    )
 
     def runWithConnection(
         func: Callable[..., R], *args: Any, **kwargs: Any
@@ -760,7 +791,7 @@ def get_clock() -> Tuple[ThreadedMemoryReactorClock, Clock]:
     return clock, hs_clock
 
 
-@implementer(ITransport)
+@implementer(ITCPTransport)
 @attr.s(cmp=False, auto_attribs=True)
 class FakeTransport:
     """
@@ -789,12 +820,12 @@ class FakeTransport:
     will get called back for connectionLost() notifications etc.
     """
 
-    _peer_address: IAddress = attr.Factory(
+    _peer_address: Union[IPv4Address, IPv6Address] = attr.Factory(
         lambda: address.IPv4Address("TCP", "127.0.0.1", 5678)
     )
     """The value to be returned by getPeer"""
 
-    _host_address: IAddress = attr.Factory(
+    _host_address: Union[IPv4Address, IPv6Address] = attr.Factory(
         lambda: address.IPv4Address("TCP", "127.0.0.1", 1234)
     )
     """The value to be returned by getHost"""
@@ -806,10 +837,10 @@ class FakeTransport:
     producer: Optional[IPushProducer] = None
     autoflush: bool = True
 
-    def getPeer(self) -> IAddress:
+    def getPeer(self) -> Union[IPv4Address, IPv6Address]:
         return self._peer_address
 
-    def getHost(self) -> IAddress:
+    def getHost(self) -> Union[IPv4Address, IPv6Address]:
         return self._host_address
 
     def loseConnection(self) -> None:
@@ -919,6 +950,51 @@ class FakeTransport:
             logger.info("FakeTransport: Buffer now empty, completing disconnect")
             self.disconnected = True
 
+    ## ITCPTransport methods. ##
+
+    def loseWriteConnection(self) -> None:
+        """
+        Half-close the write side of a TCP connection.
+
+        If the protocol instance this is attached to provides
+        IHalfCloseableProtocol, it will get notified when the operation is
+        done. When closing write connection, as with loseConnection this will
+        only happen when buffer has emptied and there is no registered
+        producer.
+        """
+        raise NotImplementedError()
+
+    def getTcpNoDelay(self) -> bool:
+        """
+        Return if C{TCP_NODELAY} is enabled.
+        """
+        return False
+
+    def setTcpNoDelay(self, enabled: bool) -> None:
+        """
+        Enable/disable C{TCP_NODELAY}.
+
+        Enabling C{TCP_NODELAY} turns off Nagle's algorithm. Small packets are
+        sent sooner, possibly at the expense of overall throughput.
+        """
+        # Ignore setting this.
+
+    def getTcpKeepAlive(self) -> bool:
+        """
+        Return if C{SO_KEEPALIVE} is enabled.
+        """
+        return False
+
+    def setTcpKeepAlive(self, enabled: bool) -> None:
+        """
+        Enable/disable C{SO_KEEPALIVE}.
+
+        Enabling C{SO_KEEPALIVE} sends packets periodically when the connection
+        is otherwise idle, usually once every two hours. They are intended
+        to allow detection of lost peers in a non-infinite amount of time.
+        """
+        # Ignore setting this.
+
 
 def connect_client(
     reactor: ThreadedMemoryReactorClock, client_id: int
@@ -940,7 +1016,7 @@ def connect_client(
 
 
 class TestHomeServer(HomeServer):
-    DATASTORE_CLASS = DataStore  # type: ignore[assignment]
+    DATASTORE_CLASS = DataStore
 
 
 def setup_test_homeserver(
@@ -1012,12 +1088,19 @@ def setup_test_homeserver(
             "args": {"database": test_db_location, "cp_min": 1, "cp_max": 1},
         }
 
+        server_name = config.server.server_name
+        if not isinstance(server_name, str):
+            raise ConfigError("Must be a string", ("server_name",))
+
         # Check if we have set up a DB that we can use as a template.
         global PREPPED_SQLITE_DB_CONN
         if PREPPED_SQLITE_DB_CONN is None:
             temp_engine = create_engine(database_config)
             PREPPED_SQLITE_DB_CONN = LoggingDatabaseConnection(
-                sqlite3.connect(":memory:"), temp_engine, "PREPPED_CONN"
+                conn=sqlite3.connect(":memory:"),
+                engine=temp_engine,
+                default_txn_name="PREPPED_CONN",
+                server_name=server_name,
             )
 
             database = DatabaseConnectionConfig("master", database_config)
@@ -1146,10 +1229,21 @@ def setup_test_homeserver(
 
     hs.get_auth_handler().validate_hash = validate_hash  # type: ignore[assignment]
 
+    # We need to replace the media threadpool with the fake test threadpool.
+    def thread_pool() -> threadpool.ThreadPool:
+        return reactor.getThreadPool()
+
+    hs.get_media_sender_thread_pool = thread_pool  # type: ignore[method-assign]
+
     # Load any configured modules into the homeserver
     module_api = hs.get_module_api()
     for module, module_config in hs.config.modules.loaded_modules:
         module(config=module_config, api=module_api)
+
+    if hs.config.auto_accept_invites.enabled:
+        # Start the local auto_accept_invites module.
+        m = InviteAutoAccepter(hs.config.auto_accept_invites, module_api)
+        logger.info("Loaded local module %s", m)
 
     load_legacy_spam_checkers(hs)
     load_legacy_third_party_event_rules(hs)

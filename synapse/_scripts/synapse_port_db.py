@@ -42,12 +42,12 @@ from typing import (
     Set,
     Tuple,
     Type,
+    TypedDict,
     TypeVar,
     cast,
 )
 
 import yaml
-from typing_extensions import TypedDict
 
 from twisted.internet import defer, reactor as reactor_
 
@@ -88,6 +88,7 @@ from synapse.storage.databases.main.relations import RelationsWorkerStore
 from synapse.storage.databases.main.room import RoomBackgroundUpdateStore
 from synapse.storage.databases.main.roommember import RoomMemberBackgroundUpdateStore
 from synapse.storage.databases.main.search import SearchBackgroundUpdateStore
+from synapse.storage.databases.main.sliding_sync import SlidingSyncStore
 from synapse.storage.databases.main.state import MainStateBackgroundUpdateStore
 from synapse.storage.databases.main.stats import StatsStore
 from synapse.storage.databases.main.user_directory import (
@@ -119,18 +120,26 @@ BOOLEAN_COLUMNS = {
     "e2e_room_keys": ["is_verified"],
     "event_edges": ["is_state"],
     "events": ["processed", "outlier", "contains_url"],
-    "local_media_repository": ["safe_from_quarantine"],
+    "local_media_repository": ["safe_from_quarantine", "authenticated"],
+    "per_user_experimental_features": ["enabled"],
     "presence_list": ["accepted"],
     "presence_stream": ["currently_active"],
     "public_room_list_stream": ["visibility"],
     "pushers": ["enabled"],
     "redactions": ["have_censored"],
+    "remote_media_cache": ["authenticated"],
+    "room_memberships": ["participant"],
     "room_stats_state": ["is_federatable"],
     "rooms": ["is_public", "has_auth_chain_index"],
-    "users": ["shadow_banned", "approved", "locked"],
+    "sliding_sync_joined_rooms": ["is_encrypted"],
+    "sliding_sync_membership_snapshots": [
+        "has_known_state",
+        "is_encrypted",
+    ],
+    "thread_subscriptions": ["subscribed", "automatic"],
+    "users": ["shadow_banned", "approved", "locked", "suspended"],
     "un_partial_stated_event_stream": ["rejection_status_changed"],
     "users_who_share_rooms": ["share_private"],
-    "per_user_experimental_features": ["enabled"],
 }
 
 
@@ -182,6 +191,16 @@ APPEND_ONLY_TABLES = [
     "users",
 ]
 
+# These tables declare their id column with "PRIMARY KEY AUTOINCREMENT" on sqlite side
+# and with "PRIMARY KEY GENERATED ALWAYS AS IDENTITY" on postgres side. This creates an
+# implicit sequence that needs its value to be migrated separately. Additionally,
+# inserting on postgres side needs to use the "OVERRIDING SYSTEM VALUE" modifier.
+AUTOINCREMENT_TABLES = {
+    "sliding_sync_connections",
+    "sliding_sync_connection_positions",
+    "sliding_sync_connection_required_state",
+    "state_groups_pending_deletion",
+}
 
 IGNORED_TABLES = {
     # We don't port these tables, as they're a faff and we can regenerate
@@ -206,6 +225,15 @@ IGNORED_TABLES = {
     # port.
     "worker_read_write_locks_mode",
     "worker_read_write_locks",
+}
+
+
+# These background updates will not be applied upon creation of the postgres database.
+IGNORED_BACKGROUND_UPDATES = {
+    # Reapplying this background update to the postgres database is unnecessary after
+    # already having waited for the SQLite database to complete all running background
+    # updates.
+    "mark_unreferenced_state_groups_for_deletion_bg_update",
 }
 
 
@@ -249,6 +277,7 @@ class Store(
     ReceiptsBackgroundUpdateStore,
     RelationsWorkerStore,
     EventFederationWorkerStore,
+    SlidingSyncStore,
 ):
     def execute(self, f: Callable[..., R], *args: Any, **kwargs: Any) -> Awaitable[R]:
         return self.db_pool.runInteraction(f.__name__, f, *args, **kwargs)
@@ -261,11 +290,17 @@ class Store(
         return self.db_pool.runInteraction("execute_sql", r)
 
     def insert_many_txn(
-        self, txn: LoggingTransaction, table: str, headers: List[str], rows: List[Tuple]
+        self,
+        txn: LoggingTransaction,
+        table: str,
+        headers: List[str],
+        rows: List[Tuple],
+        override_system_value: bool = False,
     ) -> None:
-        sql = "INSERT INTO %s (%s) VALUES (%s)" % (
+        sql = "INSERT INTO %s (%s) %s VALUES (%s)" % (
             table,
             ", ".join(k for k in headers),
+            "OVERRIDING SYSTEM VALUE" if override_system_value else "",
             ", ".join("%s" for _ in headers),
         )
 
@@ -509,7 +544,13 @@ class Porter:
 
                 def insert(txn: LoggingTransaction) -> None:
                     assert headers is not None
-                    self.postgres_store.insert_many_txn(txn, table, headers[1:], rows)
+                    self.postgres_store.insert_many_txn(
+                        txn,
+                        table,
+                        headers[1:],
+                        rows,
+                        override_system_value=table in AUTOINCREMENT_TABLES,
+                    )
 
                     self.postgres_store.db_pool.simple_update_one_txn(
                         txn,
@@ -631,8 +672,14 @@ class Porter:
         engine = create_engine(db_config.config)
 
         hs = MockHomeserver(self.hs_config)
+        server_name = hs.hostname
 
-        with make_conn(db_config, engine, "portdb") as db_conn:
+        with make_conn(
+            db_config=db_config,
+            engine=engine,
+            default_txn_name="portdb",
+            server_name=server_name,
+        ) as db_conn:
             engine.check_database(
                 db_conn, allow_outdated_version=allow_outdated_version
             )
@@ -679,6 +726,20 @@ class Porter:
         # 0 means off. 1 means full. 2 means incremental.
         return autovacuum_setting != 0
 
+    async def remove_ignored_background_updates_from_database(self) -> None:
+        def _remove_delete_unreferenced_state_groups_bg_updates(
+            txn: LoggingTransaction,
+        ) -> None:
+            txn.execute(
+                "DELETE FROM background_updates WHERE update_name = ANY(?)",
+                (list(IGNORED_BACKGROUND_UPDATES),),
+            )
+
+        await self.postgres_store.db_pool.runInteraction(
+            "remove_delete_unreferenced_state_groups_bg_updates",
+            _remove_delete_unreferenced_state_groups_bg_updates,
+        )
+
     async def run(self) -> None:
         """Ports the SQLite database to a PostgreSQL database.
 
@@ -711,9 +772,7 @@ class Porter:
                 return
 
             # Check if all background updates are done, abort if not.
-            updates_complete = (
-                await self.sqlite_store.db_pool.updates.has_completed_background_updates()
-            )
+            updates_complete = await self.sqlite_store.db_pool.updates.has_completed_background_updates()
             if not updates_complete:
                 end_error = (
                     "Pending background updates exist in the SQLite3 database."
@@ -725,6 +784,8 @@ class Porter:
             self.postgres_store = self.build_db_store(
                 self.hs_config.database.get_single_database()
             )
+
+            await self.remove_ignored_background_updates_from_database()
 
             await self.run_background_updates_on_postgres()
 
@@ -777,22 +838,87 @@ class Porter:
             await self._setup_events_stream_seqs()
             await self._setup_sequence(
                 "un_partial_stated_event_stream_sequence",
-                ("un_partial_stated_event_stream",),
+                [("un_partial_stated_event_stream", "stream_id")],
             )
             await self._setup_sequence(
-                "device_inbox_sequence", ("device_inbox", "device_federation_outbox")
+                "device_inbox_sequence",
+                [
+                    ("device_inbox", "stream_id"),
+                    ("device_federation_outbox", "stream_id"),
+                ],
             )
             await self._setup_sequence(
                 "account_data_sequence",
-                ("room_account_data", "room_tags_revisions", "account_data"),
+                [
+                    ("room_account_data", "stream_id"),
+                    ("room_tags_revisions", "stream_id"),
+                    ("account_data", "stream_id"),
+                ],
             )
-            await self._setup_sequence("receipts_sequence", ("receipts_linearized",))
-            await self._setup_sequence("presence_stream_sequence", ("presence_stream",))
+            await self._setup_sequence(
+                "receipts_sequence",
+                [
+                    ("receipts_linearized", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "presence_stream_sequence",
+                [
+                    ("presence_stream", "stream_id"),
+                ],
+            )
             await self._setup_auth_chain_sequence()
             await self._setup_sequence(
                 "application_services_txn_id_seq",
-                ("application_services_txns",),
-                "txn_id",
+                [
+                    (
+                        "application_services_txns",
+                        "txn_id",
+                    )
+                ],
+            )
+            await self._setup_sequence(
+                "device_lists_sequence",
+                [
+                    ("device_lists_stream", "stream_id"),
+                    ("user_signature_stream", "stream_id"),
+                    ("device_lists_outbound_pokes", "stream_id"),
+                    ("device_lists_changes_in_room", "stream_id"),
+                    ("device_lists_remote_pending", "stream_id"),
+                    ("device_lists_changes_converted_stream_position", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "e2e_cross_signing_keys_sequence",
+                [
+                    ("e2e_cross_signing_keys", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "push_rules_stream_sequence",
+                [
+                    ("push_rules_stream", "stream_id"),
+                ],
+            )
+            await self._setup_sequence(
+                "pushers_sequence",
+                [
+                    ("pushers", "id"),
+                    ("deleted_pushers", "stream_id"),
+                ],
+            )
+
+            await self._setup_autoincrement_sequence(
+                "sliding_sync_connection_positions", "connection_position"
+            )
+            await self._setup_autoincrement_sequence(
+                "sliding_sync_connection_required_state", "required_state_id"
+            )
+            await self._setup_autoincrement_sequence(
+                "sliding_sync_connections", "connection_key"
+            )
+            await self._setup_autoincrement_sequence(
+                "state_groups_pending_deletion", "sequence_number"
             )
 
             # Step 3. Get tables.
@@ -976,7 +1102,7 @@ class Porter:
 
         def get_sent_table_size(txn: LoggingTransaction) -> int:
             txn.execute(
-                "SELECT count(*) FROM sent_transactions" " WHERE ts >= ?", (yesterday,)
+                "SELECT count(*) FROM sent_transactions WHERE ts >= ?", (yesterday,)
             )
             result = txn.fetchone()
             assert result is not None
@@ -1037,10 +1163,10 @@ class Porter:
         return done, remaining + done
 
     async def _setup_state_group_id_seq(self) -> None:
-        curr_id: Optional[int] = (
-            await self.sqlite_store.db_pool.simple_select_one_onecol(
-                table="state_groups", keyvalues={}, retcol="MAX(id)", allow_none=True
-            )
+        curr_id: Optional[
+            int
+        ] = await self.sqlite_store.db_pool.simple_select_one_onecol(
+            table="state_groups", keyvalues={}, retcol="MAX(id)", allow_none=True
         )
 
         if not curr_id:
@@ -1101,12 +1227,11 @@ class Porter:
     async def _setup_sequence(
         self,
         sequence_name: str,
-        stream_id_tables: Iterable[str],
-        column_name: str = "stream_id",
+        stream_id_tables: Iterable[Tuple[str, str]],
     ) -> None:
         """Set a sequence to the correct value."""
         current_stream_ids = []
-        for stream_id_table in stream_id_tables:
+        for stream_id_table, column_name in stream_id_tables:
             max_stream_id = cast(
                 int,
                 await self.sqlite_store.db_pool.simple_select_one_onecol(
@@ -1128,14 +1253,57 @@ class Porter:
             "_setup_%s" % (sequence_name,), r
         )
 
-    async def _setup_auth_chain_sequence(self) -> None:
-        curr_chain_id: Optional[int] = (
-            await self.sqlite_store.db_pool.simple_select_one_onecol(
-                table="event_auth_chains",
-                keyvalues={},
-                retcol="MAX(chain_id)",
-                allow_none=True,
+    async def _setup_autoincrement_sequence(
+        self,
+        sqlite_table_name: str,
+        sqlite_id_column_name: str,
+    ) -> None:
+        """Set a sequence to the correct value. Use where id column was declared with PRIMARY KEY AUTOINCREMENT."""
+        seq_name = await self._pg_get_serial_sequence(
+            sqlite_table_name, sqlite_id_column_name
+        )
+        if seq_name is None:
+            raise Exception(
+                "implicit sequence not found for table " + sqlite_table_name
             )
+
+        seq_value = await self.sqlite_store.db_pool.simple_select_one_onecol(
+            table="sqlite_sequence",
+            keyvalues={"name": sqlite_table_name},
+            retcol="seq",
+            allow_none=True,
+        )
+        if seq_value is None:
+            return
+
+        def r(txn: LoggingTransaction) -> None:
+            sql = "ALTER SEQUENCE %s RESTART WITH" % (seq_name,)
+            txn.execute(sql + " %s", (seq_value + 1,))
+
+        await self.postgres_store.db_pool.runInteraction("_setup_%s" % (seq_name,), r)
+
+    async def _pg_get_serial_sequence(self, table: str, column: str) -> Optional[str]:
+        """Returns the name of the postgres sequence associated with a column, or NULL."""
+
+        def r(txn: LoggingTransaction) -> Optional[str]:
+            txn.execute("SELECT pg_get_serial_sequence('%s', '%s')" % (table, column))
+            result = txn.fetchone()
+            if not result:
+                return None
+            return result[0]
+
+        return await self.postgres_store.db_pool.runInteraction(
+            "_pg_get_serial_sequence", r
+        )
+
+    async def _setup_auth_chain_sequence(self) -> None:
+        curr_chain_id: Optional[
+            int
+        ] = await self.sqlite_store.db_pool.simple_select_one_onecol(
+            table="event_auth_chains",
+            keyvalues={},
+            retcol="MAX(chain_id)",
+            allow_none=True,
         )
 
         def r(txn: LoggingTransaction) -> None:

@@ -169,6 +169,7 @@ Gotchas
   than one caller? Will all of those calling functions have be in a context
   with an active span?
 """
+
 import contextlib
 import enum
 import inspect
@@ -250,18 +251,17 @@ class _DummyTagNames:
 try:
     import opentracing
     import opentracing.tags
+    from opentracing.scope_managers.contextvars import ContextVarsScopeManager
 
     tags = opentracing.tags
 except ImportError:
     opentracing = None  # type: ignore[assignment]
     tags = _DummyTagNames  # type: ignore[assignment]
+    ContextVarsScopeManager = None  # type: ignore
 try:
     from jaeger_client import Config as JaegerConfig
-
-    from synapse.logging.scopecontextmanager import LogContextScopeManager
 except ImportError:
     JaegerConfig = None  # type: ignore
-    LogContextScopeManager = None  # type: ignore
 
 
 try:
@@ -414,7 +414,7 @@ def ensure_active_span(
     """
 
     def ensure_active_span_inner_1(
-        func: Callable[P, R]
+        func: Callable[P, R],
     ) -> Callable[P, Union[Optional[T], R]]:
         @wraps(func)
         def ensure_active_span_inner_2(
@@ -483,7 +483,7 @@ def init_tracer(hs: "HomeServer") -> None:
     config = JaegerConfig(
         config=jaeger_config,
         service_name=f"{hs.config.server.server_name} {instance_name_by_type}",
-        scope_manager=LogContextScopeManager(),
+        scope_manager=ContextVarsScopeManager(),
         metrics_factory=PrometheusMetricsFactory(),
     )
 
@@ -700,7 +700,7 @@ def set_operation_name(operation_name: str) -> None:
 
 @only_if_tracing
 def force_tracing(
-    span: Union["opentracing.Span", _Sentinel] = _Sentinel.sentinel
+    span: Union["opentracing.Span", _Sentinel] = _Sentinel.sentinel,
 ) -> None:
     """Force sampling for the active/given span and its children.
 
@@ -793,6 +793,13 @@ def inject_response_headers(response_headers: Headers) -> None:
 
     if trace_id is not None:
         response_headers.addRawHeader("Synapse-Trace-Id", f"{trace_id:x}")
+
+
+@ensure_active_span("inject the span into a header dict")
+def inject_request_headers(headers: Dict[str, str]) -> None:
+    span = opentracing.tracer.active_span
+    assert span is not None
+    opentracing.tracer.inject(span.context, opentracing.Format.HTTP_HEADERS, headers)
 
 
 @ensure_active_span(
@@ -1032,13 +1039,13 @@ def tag_args(func: Callable[P, R]) -> Callable[P, R]:
     def _wrapping_logic(
         _func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
     ) -> Generator[None, None, None]:
-        # We use `[1:]` to skip the `self` object reference and `start=1` to
-        # make the index line up with `argspec.args`.
-        #
-        # FIXME: We could update this to handle any type of function by ignoring the
-        #   first argument only if it's named `self` or `cls`. This isn't fool-proof
-        #   but handles the idiomatic cases.
-        for i, arg in enumerate(args[1:], start=1):
+        for i, arg in enumerate(args, start=0):
+            if argspec.args[i] in ("self", "cls"):
+                # Ignore `self` and `cls` values. Ideally we'd properly detect
+                # if we were wrapping a method, but that is really non-trivial
+                # and this is good enough.
+                continue
+
             set_tag(SynapseTags.FUNC_ARG_PREFIX + argspec.args[i], str(arg))
         set_tag(SynapseTags.FUNC_ARGS, str(args[len(argspec.args) :]))
         set_tag(SynapseTags.FUNC_KWARGS, str(kwargs))
@@ -1093,9 +1100,10 @@ def trace_servlet(
 
             # Mypy seems to think that start_context.tag below can be Optional[str], but
             # that doesn't appear to be correct and works in practice.
-            request_tags[
-                SynapseTags.REQUEST_TAG
-            ] = request.request_metrics.start_context.tag  # type: ignore[assignment]
+
+            request_tags[SynapseTags.REQUEST_TAG] = (
+                request.request_metrics.start_context.tag  # type: ignore[assignment]
+            )
 
             # set the tags *after* the servlet completes, in case it decided to
             # prioritise the span (tags will get dropped on unprioritised spans)

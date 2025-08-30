@@ -152,6 +152,8 @@ class Keyring:
     def __init__(
         self, hs: "HomeServer", key_fetchers: "Optional[Iterable[KeyFetcher]]" = None
     ):
+        self.server_name = hs.hostname
+
         if key_fetchers is None:
             # Always fetch keys from the database.
             mutable_key_fetchers: List[KeyFetcher] = [StoreKeyFetcher(hs)]
@@ -169,7 +171,8 @@ class Keyring:
         self._fetch_keys_queue: BatchingQueue[
             _FetchKeyRequest, Dict[str, Dict[str, FetchKeyResult]]
         ] = BatchingQueue(
-            "keyring_server",
+            name="keyring_server",
+            server_name=self.server_name,
             clock=hs.get_clock(),
             # The method called to fetch each key
             process_batch_callback=self._inner_fetch_key_requests,
@@ -473,8 +476,12 @@ class Keyring:
 
 class KeyFetcher(metaclass=abc.ABCMeta):
     def __init__(self, hs: "HomeServer"):
+        self.server_name = hs.hostname
         self._queue = BatchingQueue(
-            self.__class__.__name__, hs.get_clock(), self._fetch_keys
+            name=self.__class__.__name__,
+            server_name=self.server_name,
+            clock=hs.get_clock(),
+            process_batch_callback=self._fetch_keys,
         )
 
     async def get_keys(
@@ -589,7 +596,7 @@ class BaseV2KeyFetcher(KeyFetcher):
                 % (server_name,)
             )
 
-        for key_id, key_data in response_json["old_verify_keys"].items():
+        for key_id, key_data in response_json.get("old_verify_keys", {}).items():
             if is_signing_algorithm_supported(key_id):
                 key_base64 = key_data["key"]
                 key_bytes = decode_base64(key_base64)

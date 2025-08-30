@@ -42,6 +42,10 @@ class FederationConfig(Config):
             for domain in federation_domain_whitelist:
                 self.federation_domain_whitelist[domain] = True
 
+        self.federation_whitelist_endpoint_enabled = config.get(
+            "federation_whitelist_endpoint_enabled", False
+        )
+
         federation_metrics_domains = config.get("federation_metrics_domains") or []
         validate_config(
             _METRICS_FOR_DOMAINS_SCHEMA,
@@ -89,6 +93,22 @@ class FederationConfig(Config):
             # Set a hard-limit to not overflow the database column.
             2**62,
         )
+
+    def is_domain_allowed_according_to_federation_whitelist(self, domain: str) -> bool:
+        """
+        Returns whether a domain is allowed according to the federation whitelist. If a
+        federation whitelist is not set, all domains are allowed.
+
+        Args:
+            domain: The domain to test.
+
+        Returns:
+            True if the domain is allowed or if a whitelist is not set, False otherwise.
+        """
+        if self.federation_domain_whitelist is None:
+            return True
+
+        return domain in self.federation_domain_whitelist
 
 
 _METRICS_FOR_DOMAINS_SCHEMA = {"type": "array", "items": {"type": "string"}}

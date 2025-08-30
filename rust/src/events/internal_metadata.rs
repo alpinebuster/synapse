@@ -20,8 +20,10 @@
 
 //! Implements the internal metadata class attached to events.
 //!
-//! The internal metadata is a bit like a `TypedDict`, in that it is stored as a
-//! JSON dict in the DB. Most events have zero, or only a few, of these keys
+//! The internal metadata is a bit like a `TypedDict`, in that most of
+//! it is stored as a JSON dict in the DB (the exceptions being `outlier`
+//! and `stream_ordering` which have their own columns in the database).
+//! Most events have zero, or only a few, of these keys
 //! set. Therefore, since we care more about memory size than performance here,
 //! we store these fields in a mapping.
 //!
@@ -36,10 +38,13 @@ use anyhow::Context;
 use log::warn;
 use pyo3::{
     exceptions::PyAttributeError,
+    pybacked::PyBackedStr,
     pyclass, pymethods,
-    types::{PyDict, PyString},
-    IntoPy, PyAny, PyObject, PyResult, Python,
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyString},
+    Bound, IntoPyObject, PyAny, PyObject, PyResult, Python,
 };
+
+use crate::UnwrapInfallible;
 
 /// Definitions of the various fields of the internal metadata.
 #[derive(Clone)]
@@ -49,6 +54,7 @@ enum EventInternalMetadataData {
     RecheckRedaction(bool),
     SoftFailed(bool),
     ProactivelySend(bool),
+    PolicyServerSpammy(bool),
     Redacted(bool),
     TxnId(Box<str>),
     TokenId(i64),
@@ -57,41 +63,79 @@ enum EventInternalMetadataData {
 
 impl EventInternalMetadataData {
     /// Convert the field to its name and python object.
-    fn to_python_pair<'a>(&self, py: Python<'a>) -> (&'a PyString, PyObject) {
+    fn to_python_pair<'a>(&self, py: Python<'a>) -> (&'a Bound<'a, PyString>, Bound<'a, PyAny>) {
         match self {
-            EventInternalMetadataData::OutOfBandMembership(o) => {
-                (pyo3::intern!(py, "out_of_band_membership"), o.into_py(py))
-            }
-            EventInternalMetadataData::SendOnBehalfOf(o) => {
-                (pyo3::intern!(py, "send_on_behalf_of"), o.into_py(py))
-            }
-            EventInternalMetadataData::RecheckRedaction(o) => {
-                (pyo3::intern!(py, "recheck_redaction"), o.into_py(py))
-            }
-            EventInternalMetadataData::SoftFailed(o) => {
-                (pyo3::intern!(py, "soft_failed"), o.into_py(py))
-            }
-            EventInternalMetadataData::ProactivelySend(o) => {
-                (pyo3::intern!(py, "proactively_send"), o.into_py(py))
-            }
-            EventInternalMetadataData::Redacted(o) => {
-                (pyo3::intern!(py, "redacted"), o.into_py(py))
-            }
-            EventInternalMetadataData::TxnId(o) => (pyo3::intern!(py, "txn_id"), o.into_py(py)),
-            EventInternalMetadataData::TokenId(o) => (pyo3::intern!(py, "token_id"), o.into_py(py)),
-            EventInternalMetadataData::DeviceId(o) => {
-                (pyo3::intern!(py, "device_id"), o.into_py(py))
-            }
+            EventInternalMetadataData::OutOfBandMembership(o) => (
+                pyo3::intern!(py, "out_of_band_membership"),
+                o.into_pyobject(py)
+                    .unwrap_infallible()
+                    .to_owned()
+                    .into_any(),
+            ),
+            EventInternalMetadataData::SendOnBehalfOf(o) => (
+                pyo3::intern!(py, "send_on_behalf_of"),
+                o.into_pyobject(py).unwrap_infallible().into_any(),
+            ),
+            EventInternalMetadataData::RecheckRedaction(o) => (
+                pyo3::intern!(py, "recheck_redaction"),
+                o.into_pyobject(py)
+                    .unwrap_infallible()
+                    .to_owned()
+                    .into_any(),
+            ),
+            EventInternalMetadataData::SoftFailed(o) => (
+                pyo3::intern!(py, "soft_failed"),
+                o.into_pyobject(py)
+                    .unwrap_infallible()
+                    .to_owned()
+                    .into_any(),
+            ),
+            EventInternalMetadataData::ProactivelySend(o) => (
+                pyo3::intern!(py, "proactively_send"),
+                o.into_pyobject(py)
+                    .unwrap_infallible()
+                    .to_owned()
+                    .into_any(),
+            ),
+            EventInternalMetadataData::PolicyServerSpammy(o) => (
+                pyo3::intern!(py, "policy_server_spammy"),
+                o.into_pyobject(py)
+                    .unwrap_infallible()
+                    .to_owned()
+                    .into_any(),
+            ),
+            EventInternalMetadataData::Redacted(o) => (
+                pyo3::intern!(py, "redacted"),
+                o.into_pyobject(py)
+                    .unwrap_infallible()
+                    .to_owned()
+                    .into_any(),
+            ),
+            EventInternalMetadataData::TxnId(o) => (
+                pyo3::intern!(py, "txn_id"),
+                o.into_pyobject(py).unwrap_infallible().into_any(),
+            ),
+            EventInternalMetadataData::TokenId(o) => (
+                pyo3::intern!(py, "token_id"),
+                o.into_pyobject(py).unwrap_infallible().into_any(),
+            ),
+            EventInternalMetadataData::DeviceId(o) => (
+                pyo3::intern!(py, "device_id"),
+                o.into_pyobject(py).unwrap_infallible().into_any(),
+            ),
         }
     }
 
     /// Converts from python key/values to the field.
     ///
     /// Returns `None` if the key is a valid but unrecognized string.
-    fn from_python_pair(key: &PyAny, value: &PyAny) -> PyResult<Option<Self>> {
-        let key_str: &str = key.extract()?;
+    fn from_python_pair(
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<Option<Self>> {
+        let key_str: PyBackedStr = key.extract()?;
 
-        let e = match key_str {
+        let e = match &*key_str {
             "out_of_band_membership" => EventInternalMetadataData::OutOfBandMembership(
                 value
                     .extract()
@@ -115,6 +159,11 @@ impl EventInternalMetadataData {
                     .with_context(|| format!("'{key_str}' has invalid type"))?,
             ),
             "proactively_send" => EventInternalMetadataData::ProactivelySend(
+                value
+                    .extract()
+                    .with_context(|| format!("'{key_str}' has invalid type"))?,
+            ),
+            "policy_server_spammy" => EventInternalMetadataData::PolicyServerSpammy(
                 value
                     .extract()
                     .with_context(|| format!("'{key_str}' has invalid type"))?,
@@ -198,6 +247,8 @@ pub struct EventInternalMetadata {
     /// The stream ordering of this event. None, until it has been persisted.
     #[pyo3(get, set)]
     stream_ordering: Option<NonZeroI64>,
+    #[pyo3(get, set)]
+    instance_name: Option<String>,
 
     /// whether this event is an outlier (ie, whether we have the state at that
     /// point in the DAG)
@@ -208,11 +259,11 @@ pub struct EventInternalMetadata {
 #[pymethods]
 impl EventInternalMetadata {
     #[new]
-    fn new(dict: &PyDict) -> PyResult<Self> {
+    fn new(dict: &Bound<'_, PyDict>) -> PyResult<Self> {
         let mut data = Vec::with_capacity(dict.len());
 
         for (key, value) in dict.iter() {
-            match EventInternalMetadataData::from_python_pair(key, value) {
+            match EventInternalMetadataData::from_python_pair(&key, &value) {
                 Ok(Some(entry)) => data.push(entry),
                 Ok(None) => {}
                 Err(err) => {
@@ -226,6 +277,7 @@ impl EventInternalMetadata {
         Ok(EventInternalMetadata {
             data,
             stream_ordering: None,
+            instance_name: None,
             outlier: false,
         })
     }
@@ -234,6 +286,9 @@ impl EventInternalMetadata {
         self.clone()
     }
 
+    /// Get a dict holding the data stored in the `internal_metadata` column in the database.
+    ///
+    /// Note that `outlier` and `stream_ordering` are stored in separate columns so are not returned here.
     fn get_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = PyDict::new(py);
 
@@ -383,6 +438,17 @@ impl EventInternalMetadata {
     #[setter]
     fn set_proactively_send(&mut self, obj: bool) {
         set_property!(self, ProactivelySend, obj);
+    }
+
+    #[getter]
+    fn get_policy_server_spammy(&self) -> PyResult<bool> {
+        Ok(get_property_opt!(self, PolicyServerSpammy)
+            .copied()
+            .unwrap_or(false))
+    }
+    #[setter]
+    fn set_policy_server_spammy(&mut self, obj: bool) {
+        set_property!(self, PolicyServerSpammy, obj);
     }
 
     #[getter]

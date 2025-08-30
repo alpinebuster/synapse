@@ -17,6 +17,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
+import io
 from typing import Any, Dict, Generator
 from unittest.mock import ANY, Mock, create_autospec
 
@@ -26,13 +27,15 @@ from parameterized import parameterized
 from twisted.internet import defer
 from twisted.internet.defer import Deferred, TimeoutError
 from twisted.internet.error import ConnectingCancelledError, DNSLookupError
-from twisted.test.proto_helpers import MemoryReactor, StringTransport
+from twisted.internet.testing import MemoryReactor, StringTransport
 from twisted.web.client import Agent, ResponseNeverReceived
 from twisted.web.http import HTTPChannel
 from twisted.web.http_headers import Headers
 
 from synapse.api.errors import HttpResponseException, RequestSendFailed
+from synapse.api.ratelimiting import Ratelimiter
 from synapse.config._base import ConfigError
+from synapse.config.ratelimiting import RatelimitSettings
 from synapse.http.matrixfederationclient import (
     ByteParser,
     MatrixFederationHttpClient,
@@ -337,6 +340,81 @@ class FederationClientTests(HomeserverTestCase):
         r = self.successResultOf(d)
         self.assertEqual(r.code, 200)
 
+    def test_authed_media_redirect_response(self) -> None:
+        """
+        Validate that, when following a `Location` redirect, the
+        maximum size is _not_ set to the initial response `Content-Length` and
+        the media file can be downloaded.
+        """
+        limiter = Ratelimiter(
+            store=self.hs.get_datastores().main,
+            clock=self.clock,
+            cfg=RatelimitSettings(key="", per_second=0.17, burst_count=1048576),
+        )
+
+        output_stream = io.BytesIO()
+
+        d = defer.ensureDeferred(
+            self.cl.federation_get_file(
+                "testserv:8008", "path", output_stream, limiter, "127.0.0.1", 10000
+            )
+        )
+
+        self.pump()
+
+        clients = self.reactor.tcpClients
+        self.assertEqual(len(clients), 1)
+        (host, port, factory, _timeout, _bindAddress) = clients[0]
+        self.assertEqual(host, "1.2.3.4")
+        self.assertEqual(port, 8008)
+
+        # complete the connection and wire it up to a fake transport
+        protocol = factory.buildProtocol(None)
+        transport = StringTransport()
+        protocol.makeConnection(transport)
+
+        # Deferred does not have a result
+        self.assertNoResult(d)
+
+        redirect_data = b"\r\n\r\n--6067d4698f8d40a0a794ea7d7379d53a\r\nContent-Type: application/json\r\n\r\n{}\r\n--6067d4698f8d40a0a794ea7d7379d53a\r\nLocation: http://testserv:8008/ab/c1/2345.txt\r\n\r\n--6067d4698f8d40a0a794ea7d7379d53a--\r\n\r\n"
+        protocol.dataReceived(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Server: Fake\r\n"
+            b"Content-Length: %i\r\n"
+            b"Content-Type: multipart/mixed; boundary=6067d4698f8d40a0a794ea7d7379d53a\r\n\r\n"
+            % (len(redirect_data))
+        )
+        protocol.dataReceived(redirect_data)
+
+        # Still no result, not followed the redirect yet
+        self.assertNoResult(d)
+
+        # Now send the response returned by the server at `Location`
+        clients = self.reactor.tcpClients
+        (host, port, factory, _timeout, _bindAddress) = clients[1]
+        self.assertEqual(host, "1.2.3.4")
+        self.assertEqual(port, 8008)
+        protocol = factory.buildProtocol(None)
+        transport = StringTransport()
+        protocol.makeConnection(transport)
+
+        # make sure the length is longer than the initial response
+        data = b"Hello world!" * 30
+        protocol.dataReceived(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Server: Fake\r\n"
+            b"Content-Length: %i\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"%s\r\n"
+            b"\r\n" % (len(data), data)
+        )
+
+        # We should get a successful response
+        length, _, _ = self.successResultOf(d)
+        self.assertEqual(length, len(data))
+        self.assertEqual(output_stream.getvalue(), data)
+
     @parameterized.expand(["get_json", "post_json", "delete_json", "put_json"])
     def test_timeout_reading_body(self, method_name: str) -> None:
         """
@@ -358,8 +436,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # Send it the HTTP response
         client.dataReceived(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            b"Server: Fake\r\n\r\n"
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nServer: Fake\r\n\r\n"
         )
 
         # Push by enough to time it out
@@ -613,10 +690,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # Send it a huge HTTP response
         protocol.dataReceived(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Server: Fake\r\n"
-            b"Content-Type: application/json\r\n"
-            b"\r\n"
+            b"HTTP/1.1 200 OK\r\nServer: Fake\r\nContent-Type: application/json\r\n\r\n"
         )
 
         self.pump()
@@ -817,21 +891,30 @@ class FederationClientProxyTests(BaseMultiWorkerStreamTestCase):
         )
 
         # Fake `remoteserv:8008` responding to requests
-        mock_agent_on_federation_sender.request.side_effect = lambda *args, **kwargs: defer.succeed(
-            FakeResponse(
-                code=200,
-                body=b'{"foo": "bar"}',
-                headers=Headers(
-                    {
-                        "Content-Type": ["application/json"],
-                        "Connection": ["close, X-Foo, X-Bar"],
-                        # Should be removed because it's defined in the `Connection` header
-                        "X-Foo": ["foo"],
-                        "X-Bar": ["bar"],
-                        # Should be removed because it's a hop-by-hop header
-                        "Proxy-Authorization": "abcdef",
-                    }
-                ),
+        mock_agent_on_federation_sender.request.side_effect = (
+            lambda *args, **kwargs: defer.succeed(
+                FakeResponse(
+                    code=200,
+                    body=b'{"foo": "bar"}',
+                    headers=Headers(
+                        {
+                            "Content-Type": ["application/json"],
+                            "X-Test": ["test"],
+                            # Define some hop-by-hop headers (try with varying casing to
+                            # make sure we still match-up the headers)
+                            "Connection": ["close, X-fOo, X-Bar, X-baz"],
+                            # Should be removed because it's defined in the `Connection` header
+                            "X-Foo": ["foo"],
+                            "X-Bar": ["bar"],
+                            # (not in canonical case)
+                            "x-baZ": ["baz"],
+                            # Should be removed because it's a hop-by-hop header
+                            "Proxy-Authorization": "abcdef",
+                            # Should be removed because it's a hop-by-hop header (not in canonical case)
+                            "transfer-EnCoDiNg": "abcdef",
+                        }
+                    ),
+                )
             )
         )
 
@@ -858,9 +941,17 @@ class FederationClientProxyTests(BaseMultiWorkerStreamTestCase):
         header_names = set(headers.keys())
 
         # Make sure the response does not include the hop-by-hop headers
-        self.assertNotIn(b"X-Foo", header_names)
-        self.assertNotIn(b"X-Bar", header_names)
-        self.assertNotIn(b"Proxy-Authorization", header_names)
+        self.assertIncludes(
+            header_names,
+            {
+                b"Content-Type",
+                b"X-Test",
+                # Default headers from Twisted
+                b"Date",
+                b"Server",
+            },
+            exact=True,
+        )
         # Make sure the response is as expected back on the main worker
         self.assertEqual(res, {"foo": "bar"})
 

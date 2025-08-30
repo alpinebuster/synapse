@@ -35,6 +35,8 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -46,7 +48,7 @@ from typing import (
 
 import attr
 from prometheus_client import Counter, Histogram
-from typing_extensions import Concatenate, Literal, ParamSpec
+from typing_extensions import Concatenate, ParamSpec
 
 from twisted.enterprise import adbapi
 from twisted.internet.interfaces import IReactorCore
@@ -59,11 +61,12 @@ from synapse.logging.context import (
     current_context,
     make_deferred_yieldable,
 )
-from synapse.metrics import LaterGauge, register_threadpool
+from synapse.metrics import SERVER_NAME_LABEL, LaterGauge, register_threadpool
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage.background_updates import BackgroundUpdater
 from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.types import Connection, Cursor, SQLQueryParameters
+from synapse.types import StrCollection
 from synapse.util.async_helpers import delay_cancellation
 from synapse.util.iterutils import batch_iter
 
@@ -79,11 +82,23 @@ sql_logger = logging.getLogger("synapse.storage.SQL")
 transaction_logger = logging.getLogger("synapse.storage.txn")
 perf_logger = logging.getLogger("synapse.storage.TIME")
 
-sql_scheduling_timer = Histogram("synapse_storage_schedule_time", "sec")
+sql_scheduling_timer = Histogram(
+    "synapse_storage_schedule_time", "sec", labelnames=[SERVER_NAME_LABEL]
+)
 
-sql_query_timer = Histogram("synapse_storage_query_time", "sec", ["verb"])
-sql_txn_count = Counter("synapse_storage_transaction_time_count", "sec", ["desc"])
-sql_txn_duration = Counter("synapse_storage_transaction_time_sum", "sec", ["desc"])
+sql_query_timer = Histogram(
+    "synapse_storage_query_time", "sec", labelnames=["verb", SERVER_NAME_LABEL]
+)
+sql_txn_count = Counter(
+    "synapse_storage_transaction_time_count",
+    "sec",
+    labelnames=["desc", SERVER_NAME_LABEL],
+)
+sql_txn_duration = Counter(
+    "synapse_storage_transaction_time_sum",
+    "sec",
+    labelnames=["desc", SERVER_NAME_LABEL],
+)
 
 
 # Unique indexes which have been added in background updates. Maps from table name
@@ -115,9 +130,11 @@ class _PoolConnection(Connection):
 
 
 def make_pool(
+    *,
     reactor: IReactorCore,
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
+    server_name: str,
 ) -> adbapi.ConnectionPool:
     """Get the connection pool for the database."""
 
@@ -131,7 +148,12 @@ def make_pool(
         # etc.
         with LoggingContext("db.on_new_connection"):
             engine.on_new_connection(
-                LoggingDatabaseConnection(conn, engine, "on_new_connection")
+                LoggingDatabaseConnection(
+                    conn=conn,
+                    engine=engine,
+                    default_txn_name="on_new_connection",
+                    server_name=server_name,
+                )
             )
 
     connection_pool = adbapi.ConnectionPool(
@@ -141,15 +163,21 @@ def make_pool(
         **db_args,
     )
 
-    register_threadpool(f"database-{db_config.name}", connection_pool.threadpool)
+    register_threadpool(
+        name=f"database-{db_config.name}",
+        server_name=server_name,
+        threadpool=connection_pool.threadpool,
+    )
 
     return connection_pool
 
 
 def make_conn(
+    *,
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
     default_txn_name: str,
+    server_name: str,
 ) -> "LoggingDatabaseConnection":
     """Make a new connection to the database and return it.
 
@@ -163,13 +191,18 @@ def make_conn(
         if not k.startswith("cp_")
     }
     native_db_conn = engine.module.connect(**db_params)
-    db_conn = LoggingDatabaseConnection(native_db_conn, engine, default_txn_name)
+    db_conn = LoggingDatabaseConnection(
+        conn=native_db_conn,
+        engine=engine,
+        default_txn_name=default_txn_name,
+        server_name=server_name,
+    )
 
     engine.on_new_connection(db_conn)
     return db_conn
 
 
-@attr.s(slots=True, auto_attribs=True)
+@attr.s(slots=True, auto_attribs=True, kw_only=True)
 class LoggingDatabaseConnection:
     """A wrapper around a database connection that returns `LoggingTransaction`
     as its cursor class.
@@ -180,6 +213,7 @@ class LoggingDatabaseConnection:
     conn: Connection
     engine: BaseDatabaseEngine
     default_txn_name: str
+    server_name: str
 
     def cursor(
         self,
@@ -193,8 +227,9 @@ class LoggingDatabaseConnection:
             txn_name = self.default_txn_name
 
         return LoggingTransaction(
-            self.conn.cursor(),
+            txn=self.conn.cursor(),
             name=txn_name,
+            server_name=self.server_name,
             database_engine=self.engine,
             after_callbacks=after_callbacks,
             async_after_callbacks=async_after_callbacks,
@@ -263,6 +298,7 @@ class LoggingTransaction:
     __slots__ = [
         "txn",
         "name",
+        "server_name",
         "database_engine",
         "after_callbacks",
         "async_after_callbacks",
@@ -271,8 +307,10 @@ class LoggingTransaction:
 
     def __init__(
         self,
+        *,
         txn: Cursor,
         name: str,
+        server_name: str,
         database_engine: BaseDatabaseEngine,
         after_callbacks: Optional[List[_CallbackListEntry]] = None,
         async_after_callbacks: Optional[List[_AsyncCallbackListEntry]] = None,
@@ -280,6 +318,7 @@ class LoggingTransaction:
     ):
         self.txn = txn
         self.name = name
+        self.server_name = server_name
         self.database_engine = database_engine
         self.after_callbacks = after_callbacks
         self.async_after_callbacks = async_after_callbacks
@@ -490,7 +529,9 @@ class LoggingTransaction:
         finally:
             secs = time.time() - start
             sql_logger.debug("[SQL time] {%s} %f sec", self.name, secs)
-            sql_query_timer.labels(sql.split()[0]).observe(secs)
+            sql_query_timer.labels(
+                verb=sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
+            ).observe(secs)
 
     def close(self) -> None:
         self.txn.close()
@@ -558,17 +599,23 @@ class DatabasePool:
         engine: BaseDatabaseEngine,
     ):
         self.hs = hs
+        self.server_name = hs.hostname
         self._clock = hs.get_clock()
         self._txn_limit = database_config.config.get("txn_limit", 0)
         self._database_config = database_config
-        self._db_pool = make_pool(hs.get_reactor(), database_config, engine)
+        self._db_pool = make_pool(
+            reactor=hs.get_reactor(),
+            db_config=database_config,
+            engine=engine,
+            server_name=self.server_name,
+        )
 
         self.updates = BackgroundUpdater(hs, self)
         LaterGauge(
-            "synapse_background_update_status",
-            "Background update status",
-            [],
-            self.updates.get_status,
+            name="synapse_background_update_status",
+            desc="Background update status",
+            labelnames=[SERVER_NAME_LABEL],
+            caller=lambda: {(self.server_name,): self.updates.get_status()},
         )
 
         self._previous_txn_total_time = 0.0
@@ -599,6 +646,7 @@ class DatabasePool:
             0.0,
             run_as_background_process,
             "upsert_safety_check",
+            self.server_name,
             self._check_safe_to_upsert,
         )
 
@@ -641,6 +689,7 @@ class DatabasePool:
                 15.0,
                 run_as_background_process,
                 "upsert_safety_check",
+                self.server_name,
                 self._check_safe_to_upsert,
             )
 
@@ -863,8 +912,14 @@ class DatabasePool:
 
             self._current_txn_total_time += duration
             self._txn_perf_counters.update(desc, duration)
-            sql_txn_count.labels(desc).inc(1)
-            sql_txn_duration.labels(desc).inc(duration)
+            sql_txn_count.labels(
+                desc=desc,
+                **{SERVER_NAME_LABEL: self.server_name},
+            ).inc(1)
+            sql_txn_duration.labels(
+                desc=desc,
+                **{SERVER_NAME_LABEL: self.server_name},
+            ).inc(duration)
 
     async def runInteraction(
         self,
@@ -1000,7 +1055,9 @@ class DatabasePool:
                     operation_name="db.connection",
                 ):
                     sched_duration_sec = monotonic_time() - start_time
-                    sql_scheduling_timer.observe(sched_duration_sec)
+                    sql_scheduling_timer.labels(
+                        **{SERVER_NAME_LABEL: self.server_name}
+                    ).observe(sched_duration_sec)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:
@@ -1033,7 +1090,10 @@ class DatabasePool:
                             )
 
                         db_conn = LoggingDatabaseConnection(
-                            conn, self.engine, "runWithConnection"
+                            conn=conn,
+                            engine=self.engine,
+                            default_txn_name="runWithConnection",
+                            server_name=self.server_name,
                         )
                         return func(db_conn, *args, **kwargs)
                     finally:
@@ -1094,6 +1154,48 @@ class DatabasePool:
         )
 
         txn.execute(sql, vals)
+
+    @staticmethod
+    def simple_insert_returning_txn(
+        txn: LoggingTransaction,
+        table: str,
+        values: Dict[str, Any],
+        returning: StrCollection,
+    ) -> Tuple[Any, ...]:
+        """Executes a `INSERT INTO... RETURNING...` statement (or equivalent for
+        SQLite versions that don't support it).
+        """
+
+        if txn.database_engine.supports_returning:
+            sql = "INSERT INTO %s (%s) VALUES(%s) RETURNING %s" % (
+                table,
+                ", ".join(k for k in values.keys()),
+                ", ".join("?" for _ in values.keys()),
+                ", ".join(k for k in returning),
+            )
+
+            txn.execute(sql, list(values.values()))
+            row = txn.fetchone()
+            assert row is not None
+            return row
+        else:
+            # For old versions of SQLite we do a standard insert and then can
+            # use `last_insert_rowid` to get at the row we just inserted
+            DatabasePool.simple_insert_txn(
+                txn,
+                table=table,
+                values=values,
+            )
+            txn.execute("SELECT last_insert_rowid()")
+            row = txn.fetchone()
+            assert row is not None
+            (rowid,) = row
+
+            row = DatabasePool.simple_select_one_txn(
+                txn, table=table, keyvalues={"rowid": rowid}, retcols=returning
+            )
+            assert row is not None
+            return row
 
     async def simple_insert_many(
         self,
@@ -1254,9 +1356,9 @@ class DatabasePool:
         self,
         txn: LoggingTransaction,
         table: str,
-        keyvalues: Dict[str, Any],
-        values: Dict[str, Any],
-        insertion_values: Optional[Dict[str, Any]] = None,
+        keyvalues: Mapping[str, Any],
+        values: Mapping[str, Any],
+        insertion_values: Optional[Mapping[str, Any]] = None,
         where_clause: Optional[str] = None,
     ) -> bool:
         """
@@ -1299,9 +1401,9 @@ class DatabasePool:
         self,
         txn: LoggingTransaction,
         table: str,
-        keyvalues: Dict[str, Any],
-        values: Dict[str, Any],
-        insertion_values: Optional[Dict[str, Any]] = None,
+        keyvalues: Mapping[str, Any],
+        values: Mapping[str, Any],
+        insertion_values: Optional[Mapping[str, Any]] = None,
         where_clause: Optional[str] = None,
         lock: bool = True,
     ) -> bool:
@@ -1322,7 +1424,7 @@ class DatabasePool:
 
         if lock:
             # We need to lock the table :(
-            self.engine.lock_table(txn, table)
+            txn.database_engine.lock_table(txn, table)
 
         def _getwhere(key: str) -> str:
             # If the value we're passing in is None (aka NULL), we need to use
@@ -1376,13 +1478,13 @@ class DatabasePool:
         # successfully inserted
         return True
 
+    @staticmethod
     def simple_upsert_txn_native_upsert(
-        self,
         txn: LoggingTransaction,
         table: str,
-        keyvalues: Dict[str, Any],
-        values: Dict[str, Any],
-        insertion_values: Optional[Dict[str, Any]] = None,
+        keyvalues: Mapping[str, Any],
+        values: Mapping[str, Any],
+        insertion_values: Optional[Mapping[str, Any]] = None,
         where_clause: Optional[str] = None,
     ) -> bool:
         """
@@ -1433,13 +1535,49 @@ class DatabasePool:
         """
         Upsert, many times.
 
+        This executes a query equivalent to `INSERT INTO ... ON CONFLICT DO UPDATE`,
+        with multiple value rows.
+        The query may use emulated upserts if the database engine does not support upserts,
+        or if the table is currently unsafe to upsert.
+
+        If there are no value columns, this instead generates a `ON CONFLICT DO NOTHING`.
+
         Args:
             table: The table to upsert into
-            key_names: The key column names.
-            key_values: A list of each row's key column values.
-            value_names: The value column names
-            value_values: A list of each row's value column values.
+            key_names: The unique key column names. These are the columns used in the ON CONFLICT clause.
+            key_values: A list of each row's key column values, in the same order as `key_names`.
+            value_names: The non-unique value column names
+            value_values: A list of each row's value column values, in the same order as `value_names`.
                 Ignored if value_names is empty.
+
+        Example:
+            ```python
+            simple_upsert_many(
+                "mytable",
+                key_names=("room_id", "user_id"),
+                key_values=[
+                    ("!room1:example.org", "@user1:example.org"),
+                    ("!room2:example.org", "@user2:example.org"),
+                ],
+                value_names=("wombat_count", "is_updated"),
+                value_values=[
+                    (42, True),
+                    (7, False)
+                ],
+            )
+            ```
+
+            gives something equivalent to:
+
+            ```sql
+            INSERT INTO mytable (room_id, user_id, wombat_count, is_updated)
+            VALUES
+                ('!room1:example.org', '@user1:example.org', 42, True),
+                ('!room2:example.org', '@user2:example.org', 7, False)
+            ON CONFLICT DO UPDATE SET
+                wombat_count = EXCLUDED.wombat_count,
+                is_updated = EXCLUDED.is_updated
+            ```
         """
 
         # We can autocommit if it safe to upsert
@@ -1467,6 +1605,8 @@ class DatabasePool:
     ) -> None:
         """
         Upsert, many times.
+
+        See the documentation for `simple_upsert_many` for examples.
 
         Args:
             table: The table to upsert into
@@ -1535,8 +1675,8 @@ class DatabasePool:
 
             self.simple_upsert_txn_emulated(txn, table, _keys, _vals, lock=False)
 
+    @staticmethod
     def simple_upsert_many_txn_native_upsert(
-        self,
         txn: LoggingTransaction,
         table: str,
         key_names: Collection[str],
@@ -1966,8 +2106,8 @@ class DatabasePool:
     def simple_update_txn(
         txn: LoggingTransaction,
         table: str,
-        keyvalues: Dict[str, Any],
-        updatevalues: Dict[str, Any],
+        keyvalues: Mapping[str, Any],
+        updatevalues: Mapping[str, Any],
     ) -> int:
         """
         Update rows in the given database table.
@@ -2115,10 +2255,26 @@ class DatabasePool:
         if rowcount > 1:
             raise StoreError(500, "More than one row matched (%s)" % (table,))
 
-    # Ideally we could use the overload decorator here to specify that the
-    # return type is only optional if allow_none is True, but this does not work
-    # when you call a static method from an instance.
-    # See https://github.com/python/mypy/issues/7781
+    @overload
+    @staticmethod
+    def simple_select_one_txn(
+        txn: LoggingTransaction,
+        table: str,
+        keyvalues: Dict[str, Any],
+        retcols: Collection[str],
+        allow_none: Literal[False] = False,
+    ) -> Tuple[Any, ...]: ...
+
+    @overload
+    @staticmethod
+    def simple_select_one_txn(
+        txn: LoggingTransaction,
+        table: str,
+        keyvalues: Dict[str, Any],
+        retcols: Collection[str],
+        allow_none: Literal[True] = True,
+    ) -> Optional[Tuple[Any, ...]]: ...
+
     @staticmethod
     def simple_select_one_txn(
         txn: LoggingTransaction,
@@ -2461,7 +2617,11 @@ class DatabasePool:
 
 
 def make_in_list_sql_clause(
-    database_engine: BaseDatabaseEngine, column: str, iterable: Collection[Any]
+    database_engine: BaseDatabaseEngine,
+    column: str,
+    iterable: Collection[Any],
+    *,
+    negative: bool = False,
 ) -> Tuple[str, list]:
     """Returns an SQL clause that checks the given column is in the iterable.
 
@@ -2474,6 +2634,7 @@ def make_in_list_sql_clause(
         database_engine
         column: Name of the column
         iterable: The values to check the column against.
+        negative: Whether we should check for inequality, i.e. `NOT IN`
 
     Returns:
         A tuple of SQL query and the args
@@ -2482,9 +2643,19 @@ def make_in_list_sql_clause(
     if database_engine.supports_using_any_list:
         # This should hopefully be faster, but also makes postgres query
         # stats easier to understand.
-        return "%s = ANY(?)" % (column,), [list(iterable)]
+        if not negative:
+            clause = f"{column} = ANY(?)"
+        else:
+            clause = f"{column} != ALL(?)"
+
+        return clause, [list(iterable)]
     else:
-        return "%s IN (%s)" % (column, ",".join("?" for _ in iterable)), list(iterable)
+        params = ",".join("?" for _ in iterable)
+        if not negative:
+            clause = f"{column} IN ({params})"
+        else:
+            clause = f"{column} NOT IN ({params})"
+        return clause, list(iterable)
 
 
 # These overloads ensure that `columns` and `iterable` values have the same length.

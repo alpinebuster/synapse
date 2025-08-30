@@ -31,16 +31,17 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Protocol,
     Tuple,
     Union,
 )
 
+import attr
 import treq
 from canonicaljson import encode_canonical_json
 from netaddr import AddrFormatError, IPAddress, IPSet
 from prometheus_client import Counter
-from typing_extensions import Protocol
-from zope.interface import implementer, provider
+from zope.interface import implementer
 
 from OpenSSL import SSL
 from OpenSSL.SSL import VERIFY_NONE
@@ -84,6 +85,7 @@ from synapse.http.replicationagent import ReplicationAgent
 from synapse.http.types import QueryParams
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.logging.opentracing import set_tag, start_active_span, tags
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.types import ISynapseReactor, StrSequence
 from synapse.util import json_decoder
 from synapse.util.async_helpers import timeout_deferred
@@ -91,11 +93,29 @@ from synapse.util.async_helpers import timeout_deferred
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
+# Support both import names for the `python-multipart` (PyPI) library,
+# which renamed its package name from `multipart` to `python_multipart`
+# in 0.0.13 (though supports the old import name for compatibility).
+# Note that the `multipart` package name conflicts with `multipart` (PyPI)
+# so we should prefer importing from `python_multipart` when possible.
+try:
+    from python_multipart import MultipartParser
+
+    if TYPE_CHECKING:
+        from python_multipart import multipart
+except ImportError:
+    from multipart import MultipartParser  # type: ignore[no-redef]
+
+
 logger = logging.getLogger(__name__)
 
-outgoing_requests_counter = Counter("synapse_http_client_requests", "", ["method"])
+outgoing_requests_counter = Counter(
+    "synapse_http_client_requests", "", labelnames=["method", SERVER_NAME_LABEL]
+)
 incoming_responses_counter = Counter(
-    "synapse_http_client_responses", "", ["method", "code"]
+    "synapse_http_client_responses",
+    "",
+    labelnames=["method", "code", SERVER_NAME_LABEL],
 )
 
 # the type of the headers map, to be passed to the t.w.h.Headers.
@@ -198,7 +218,7 @@ class _IPBlockingResolver:
 
                 if _is_ip_blocked(ip_address, self._ip_allowlist, self._ip_blocklist):
                     logger.info(
-                        "Blocked %s from DNS resolution to %s" % (ip_address, hostname)
+                        "Blocked %s from DNS resolution to %s", ip_address, hostname
                     )
                     has_bad_ip = True
 
@@ -210,7 +230,7 @@ class _IPBlockingResolver:
                     recv.addressResolved(address)
             recv.resolutionComplete()
 
-        @provider(IResolutionReceiver)
+        @implementer(IResolutionReceiver)
         class EndpointReceiver:
             @staticmethod
             def resolutionBegan(resolutionInProgress: IHostResolution) -> None:
@@ -224,8 +244,9 @@ class _IPBlockingResolver:
             def resolutionComplete() -> None:
                 _callback()
 
+        endpoint_receiver_wrapper = EndpointReceiver()
         self._reactor.nameResolver.resolveHostName(
-            EndpointReceiver, hostname, portNumber=portNumber
+            endpoint_receiver_wrapper, hostname, portNumber=portNumber
         )
 
         return recv
@@ -302,7 +323,7 @@ class BlocklistingAgentWrapper(Agent):
             pass
         else:
             if _is_ip_blocked(ip_address, self._ip_allowlist, self._ip_blocklist):
-                logger.info("Blocking access to %s" % (ip_address,))
+                logger.info("Blocking access to %s", ip_address)
                 e = SynapseError(HTTPStatus.FORBIDDEN, "IP address blocked")
                 return defer.fail(Failure(e))
 
@@ -330,6 +351,7 @@ class BaseHttpClient:
         treq_args: Optional[Dict[str, Any]] = None,
     ):
         self.hs = hs
+        self.server_name = hs.hostname
         self.reactor = hs.get_reactor()
 
         self._extra_treq_args = treq_args or {}
@@ -368,7 +390,9 @@ class BaseHttpClient:
             RequestTimedOutError if the request times out before the headers are read
 
         """
-        outgoing_requests_counter.labels(method).inc()
+        outgoing_requests_counter.labels(
+            method=method, **{SERVER_NAME_LABEL: self.server_name}
+        ).inc()
 
         # log request but strip `access_token` (AS requests for example include this)
         logger.debug("Sending request %s %s", method, redact_uri(uri))
@@ -422,7 +446,11 @@ class BaseHttpClient:
 
                 response = await make_deferred_yieldable(request_deferred)
 
-                incoming_responses_counter.labels(method, response.code).inc()
+                incoming_responses_counter.labels(
+                    method=method,
+                    code=response.code,
+                    **{SERVER_NAME_LABEL: self.server_name},
+                ).inc()
                 logger.info(
                     "Received response to %s %s: %s",
                     method,
@@ -431,7 +459,11 @@ class BaseHttpClient:
                 )
                 return response
             except Exception as e:
-                incoming_responses_counter.labels(method, "ERR").inc()
+                incoming_responses_counter.labels(
+                    method=method,
+                    code="ERR",
+                    **{SERVER_NAME_LABEL: self.server_name},
+                ).inc()
                 logger.info(
                     "Error sending request to  %s %s: %s %s",
                     method,
@@ -707,7 +739,7 @@ class BaseHttpClient:
         resp_headers = dict(response.headers.getAllRawHeaders())
 
         if response.code > 299:
-            logger.warning("Got %d when downloading %s" % (response.code, url))
+            logger.warning("Got %d when downloading %s", response.code, url)
             raise SynapseError(
                 HTTPStatus.BAD_GATEWAY, "Got error %d" % (response.code,), Codes.UNKNOWN
             )
@@ -805,12 +837,12 @@ class SimpleHttpClient(BaseHttpClient):
         pool.cachedConnectionTimeout = 2 * 60
 
         self.agent: IAgent = ProxyAgent(
-            self.reactor,
-            hs.get_reactor(),
+            reactor=self.reactor,
+            proxy_reactor=hs.get_reactor(),
             connectTimeout=15,
             contextFactory=self.hs.get_http_client_context_factory(),
             pool=pool,
-            use_proxy=use_proxy,
+            proxy_config=hs.config.server.proxy_config,
         )
 
         if self._ip_blocklist:
@@ -839,6 +871,7 @@ class ReplicationClient(BaseHttpClient):
             hs: The HomeServer instance to pass in
         """
         super().__init__(hs)
+        self.server_name = hs.hostname
 
         # Use a pool, but a very small one.
         pool = HTTPConnectionPool(self.reactor)
@@ -875,7 +908,9 @@ class ReplicationClient(BaseHttpClient):
             RequestTimedOutError if the request times out before the headers are read
 
         """
-        outgoing_requests_counter.labels(method).inc()
+        outgoing_requests_counter.labels(
+            method=method, **{SERVER_NAME_LABEL: self.server_name}
+        ).inc()
 
         logger.debug("Sending request %s %s", method, uri)
 
@@ -932,7 +967,11 @@ class ReplicationClient(BaseHttpClient):
 
                 response = await make_deferred_yieldable(request_deferred)
 
-                incoming_responses_counter.labels(method, response.code).inc()
+                incoming_responses_counter.labels(
+                    method=method,
+                    code=response.code,
+                    **{SERVER_NAME_LABEL: self.server_name},
+                ).inc()
                 logger.info(
                     "Received response to %s %s: %s",
                     method,
@@ -941,7 +980,11 @@ class ReplicationClient(BaseHttpClient):
                 )
                 return response
             except Exception as e:
-                incoming_responses_counter.labels(method, "ERR").inc()
+                incoming_responses_counter.labels(
+                    method=method,
+                    code="ERR",
+                    **{SERVER_NAME_LABEL: self.server_name},
+                ).inc()
                 logger.info(
                     "Error sending request to  %s %s: %s %s",
                     method,
@@ -1004,6 +1047,129 @@ class _DiscardBodyWithMaxSizeProtocol(protocol.Protocol):
 
     def connectionLost(self, reason: Failure = connectionDone) -> None:
         self._maybe_fail()
+
+
+@attr.s(auto_attribs=True, slots=True)
+class MultipartResponse:
+    """
+    A small class to hold parsed values of a multipart response.
+    """
+
+    json: bytes = b"{}"
+    length: Optional[int] = None
+    content_type: Optional[bytes] = None
+    disposition: Optional[bytes] = None
+    url: Optional[bytes] = None
+
+
+class _MultipartParserProtocol(protocol.Protocol):
+    """
+    Protocol to read and parse a MSC3916 multipart/mixed response
+    """
+
+    transport: Optional[ITCPTransport] = None
+
+    def __init__(
+        self,
+        stream: ByteWriteable,
+        deferred: defer.Deferred,
+        boundary: str,
+        max_length: Optional[int],
+    ) -> None:
+        self.stream = stream
+        self.deferred = deferred
+        self.boundary = boundary
+        self.max_length = max_length
+        self.parser: Optional[MultipartParser] = None
+        self.multipart_response = MultipartResponse()
+        self.has_redirect = False
+        self.in_json = False
+        self.json_done = False
+        self.file_length = 0
+        self.total_length = 0
+        self.in_disposition = False
+        self.in_content_type = False
+
+    def dataReceived(self, incoming_data: bytes) -> None:
+        if self.deferred.called:
+            return
+
+        # we don't have a parser yet, instantiate it
+        if not self.parser:
+
+            def on_header_field(data: bytes, start: int, end: int) -> None:
+                if data[start:end].lower() == b"location":
+                    self.has_redirect = True
+                if data[start:end].lower() == b"content-disposition":
+                    self.in_disposition = True
+                if data[start:end].lower() == b"content-type":
+                    self.in_content_type = True
+
+            def on_header_value(data: bytes, start: int, end: int) -> None:
+                # the first header should be content-type for application/json
+                if not self.in_json and not self.json_done:
+                    assert data[start:end] == b"application/json"
+                    self.in_json = True
+                elif self.has_redirect:
+                    self.multipart_response.url = data[start:end]
+                elif self.in_content_type:
+                    self.multipart_response.content_type = data[start:end]
+                    self.in_content_type = False
+                elif self.in_disposition:
+                    self.multipart_response.disposition = data[start:end]
+                    self.in_disposition = False
+
+            def on_part_data(data: bytes, start: int, end: int) -> None:
+                # we've seen json header but haven't written the json data
+                if self.in_json and not self.json_done:
+                    self.multipart_response.json = data[start:end]
+                    self.json_done = True
+                # we have a redirect header rather than a file, and have already captured it
+                elif self.has_redirect:
+                    return
+                # otherwise we are in the file part
+                else:
+                    try:
+                        self.stream.write(data[start:end])
+                    except Exception as e:
+                        logger.warning(
+                            "Exception encountered writing file data to stream: %s", e
+                        )
+                        self.deferred.errback()
+                    self.file_length += end - start
+
+            callbacks: "multipart.MultipartCallbacks" = {
+                "on_header_field": on_header_field,
+                "on_header_value": on_header_value,
+                "on_part_data": on_part_data,
+            }
+            self.parser = MultipartParser(self.boundary, callbacks)
+
+        self.total_length += len(incoming_data)
+        if self.max_length is not None and self.total_length >= self.max_length:
+            self.deferred.errback(BodyExceededMaxSize())
+            # Close the connection (forcefully) since all the data will get
+            # discarded anyway.
+            assert self.transport is not None
+            self.transport.abortConnection()
+
+        try:
+            self.parser.write(incoming_data)
+        except Exception as e:
+            logger.warning("Exception writing to multipart parser: %s", e)
+            self.deferred.errback()
+            return
+
+    def connectionLost(self, reason: Failure = connectionDone) -> None:
+        # If the maximum size was already exceeded, there's nothing to do.
+        if self.deferred.called:
+            return
+
+        if reason.check(ResponseDone):
+            self.multipart_response.length = self.file_length
+            self.deferred.callback(self.multipart_response)
+        else:
+            self.deferred.errback(reason)
 
 
 class _ReadBodyWithMaxSizeProtocol(protocol.Protocol):
@@ -1091,6 +1257,32 @@ def read_body_with_max_size(
     return d
 
 
+def read_multipart_response(
+    response: IResponse, stream: ByteWriteable, boundary: str, max_length: Optional[int]
+) -> "defer.Deferred[MultipartResponse]":
+    """
+    Reads a MSC3916 multipart/mixed response and parses it, reading the file part (if it contains one) into
+    the stream passed in and returning a deferred resolving to a MultipartResponse
+
+    Args:
+        response: The HTTP response to read from.
+        stream: The file-object to write to.
+        boundary: the multipart/mixed boundary string
+        max_length: maximum allowable length of the response
+    """
+    d: defer.Deferred[MultipartResponse] = defer.Deferred()
+
+    # If the Content-Length header gives a size larger than the maximum allowed
+    # size, do not bother downloading the body.
+    if max_length is not None and response.length != UNKNOWN_LENGTH:
+        if response.length > max_length:
+            response.deliverBody(_DiscardBodyWithMaxSizeProtocol(d))
+            return d
+
+    response.deliverBody(_MultipartParserProtocol(stream, d, boundary, max_length))
+    return d
+
+
 def encode_query_args(args: Optional[QueryParams]) -> bytes:
     """
     Encodes a map of query arguments to bytes which can be appended to a URL.
@@ -1162,6 +1354,5 @@ def is_unknown_endpoint(
         )
     ) or (
         # Older Synapses returned a 400 error.
-        e.code == 400
-        and synapse_error.errcode == Codes.UNRECOGNIZED
+        e.code == 400 and synapse_error.errcode == Codes.UNRECOGNIZED
     )

@@ -36,6 +36,10 @@ The following query parameters are available:
   - the room's name,
   - the local part of the room's canonical alias, or
   - the complete (local and server part) room's id (case sensitive).
+* `public_rooms` - Optional flag to filter public rooms. If `true`, only public rooms are queried. If `false`, public rooms are excluded from
+  the query. When the flag is absent (the default), **both** public and non-public rooms are included in the search results.
+* `empty_rooms` - Optional flag to filter empty rooms. A room is empty if joined_members is zero. If `true`, only empty rooms are queried. If `false`, empty rooms are excluded from
+  the query. When the flag is absent (the default), **both** empty and non-empty rooms are included in the search results.
 
   Defaults to no filtering.
 
@@ -380,6 +384,13 @@ The API is:
 ```
 GET /_synapse/admin/v1/rooms/<room_id>/state
 ```
+
+**Parameters**
+
+The following query parameter is available:
+
+* `type` - The type of room state event to filter by, eg "m.room.create". If provided, only state events
+    of this type will be returned (regardless of their `state_key` value).
 
 A response body like the following is returned:
 
@@ -783,6 +794,7 @@ A response body like the following is returned:
     "results": [
         {
             "delete_id": "delete_id1",
+            "room_id": "!roomid:example.com",
             "status": "failed",
             "error": "error message",
             "shutdown_room": {
@@ -793,7 +805,8 @@ A response body like the following is returned:
             }
         }, {
             "delete_id": "delete_id2",
-            "status": "purging",
+            "room_id": "!roomid:example.com",
+            "status": "active",
             "shutdown_room": {
                 "kicked_users": [
                     "@foobar:example.com"
@@ -830,7 +843,9 @@ A response body like the following is returned:
 
 ```json
 {
-    "status": "purging",
+    "status": "active",
+    "delete_id": "bHkCNQpHqOaFhPtK",
+    "room_id": "!roomid:example.com",
     "shutdown_room": {
         "kicked_users": [
             "@foobar:example.com"
@@ -858,10 +873,11 @@ The following fields are returned in the JSON response body:
 - `results` - An array of objects, each containing information about one task.
   This field is omitted from the result when you query by `delete_id`.
   Task objects contain the following fields:
-  - `delete_id` - The ID for this purge if you query by `room_id`.
+  - `delete_id` - The ID for this purge
+  - `room_id` - The ID of the room being deleted
   - `status` - The status will be one of:
-    - `shutting_down` - The process is removing users from the room.
-    - `purging` - The process is purging the room and event data from database.
+    - `scheduled` - The deletion is waiting to be started
+    - `active` - The process is purging the room and event data from database.
     - `complete` - The process has completed successfully.
     - `failed` - The process is aborted, an error has occurred.
   - `error` - A string that shows an error message if `status` is `failed`.

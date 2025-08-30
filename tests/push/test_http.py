@@ -17,16 +17,19 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 from unittest.mock import Mock
 
+from parameterized import parameterized
+
 from twisted.internet.defer import Deferred
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 import synapse.rest.admin
 from synapse.logging.context import make_deferred_yieldable
 from synapse.push import PusherConfig, PusherConfigException
-from synapse.rest.client import login, push_rule, pusher, receipts, room
+from synapse.rest.admin.experimental_features import ExperimentalFeature
+from synapse.rest.client import login, push_rule, pusher, receipts, room, versions
 from synapse.server import HomeServer
 from synapse.types import JsonDict
 from synapse.util import Clock
@@ -42,6 +45,7 @@ class HTTPPusherTests(HomeserverTestCase):
         receipts.register_servlets,
         push_rule.register_servlets,
         pusher.register_servlets,
+        versions.register_servlets,
     ]
     user_id = True
     hijack_auth = False
@@ -969,6 +973,84 @@ class HTTPPusherTests(HomeserverTestCase):
             lookup_result.device_id,
         )
 
+    def test_device_id_feature_flag(self) -> None:
+        """Tests that a pusher created with a given device ID shows that device ID in
+        GET /pushers requests when feature is enabled for the user
+        """
+        user_id = self.register_user("user", "pass")
+        access_token = self.login("user", "pass")
+
+        # We create the pusher with an HTTP request rather than with
+        # _make_user_with_pusher so that we can test the device ID is correctly set when
+        # creating a pusher via an API call.
+        self.make_request(
+            method="POST",
+            path="/pushers/set",
+            content={
+                "kind": "http",
+                "app_id": "m.http",
+                "app_display_name": "HTTP Push Notifications",
+                "device_display_name": "pushy push",
+                "pushkey": "a@example.com",
+                "lang": "en",
+                "data": {"url": "http://example.com/_matrix/push/v1/notify"},
+            },
+            access_token=access_token,
+        )
+
+        # Look up the user info for the access token so we can compare the device ID.
+        store = self.hs.get_datastores().main
+        lookup_result = self.get_success(store.get_user_by_access_token(access_token))
+        assert lookup_result is not None
+
+        # Check field is not there before we enable the feature flag
+        channel = self.make_request("GET", "/pushers", access_token=access_token)
+        self.assertEqual(channel.code, 200)
+        self.assertEqual(len(channel.json_body["pushers"]), 1)
+        self.assertNotIn(
+            "org.matrix.msc3881.device_id", channel.json_body["pushers"][0]
+        )
+
+        self.get_success(
+            store.set_features_for_user(user_id, {ExperimentalFeature.MSC3881: True})
+        )
+
+        # Get the user's devices and check it has the correct device ID.
+        channel = self.make_request("GET", "/pushers", access_token=access_token)
+        self.assertEqual(channel.code, 200)
+        self.assertEqual(len(channel.json_body["pushers"]), 1)
+        self.assertEqual(
+            channel.json_body["pushers"][0]["org.matrix.msc3881.device_id"],
+            lookup_result.device_id,
+        )
+
+    def test_msc3881_client_versions_flag(self) -> None:
+        """Tests that MSC3881 only appears in /versions if user has it enabled."""
+
+        user_id = self.register_user("user", "pass")
+        access_token = self.login("user", "pass")
+
+        # Check feature is disabled in /versions
+        channel = self.make_request(
+            "GET", "/_matrix/client/versions", access_token=access_token
+        )
+        self.assertEqual(channel.code, 200)
+        self.assertFalse(channel.json_body["unstable_features"]["org.matrix.msc3881"])
+
+        # Enable feature for user
+        self.get_success(
+            self.hs.get_datastores().main.set_features_for_user(
+                user_id, {ExperimentalFeature.MSC3881: True}
+            )
+        )
+
+        # Check feature is now enabled in /versions for user
+        channel = self.make_request(
+            "GET", "/_matrix/client/versions", access_token=access_token
+        )
+        self.assertEqual(channel.code, 200)
+        self.assertTrue(channel.json_body["unstable_features"]["org.matrix.msc3881"])
+
     @override_config({"push": {"jitter_delay": "10s"}})
     def test_jitter(self) -> None:
         """Tests that enabling jitter actually delays sending push."""
@@ -1005,3 +1087,161 @@ class HTTPPusherTests(HomeserverTestCase):
             self.pump()
 
         self.assertEqual(len(self.push_attempts), 11)
+
+    @parameterized.expand(
+        [
+            # Badge count disabled
+            (True, True),
+            (True, False),
+            # Badge count enabled
+            (False, True),
+            (False, False),
+        ]
+    )
+    @override_config({"experimental_features": {"msc4076_enabled": True}})
+    def test_msc4076_badge_count(
+        self, disable_badge_count: bool, event_id_only: bool
+    ) -> None:
+        # Register the user who gets notified
+        user_id = self.register_user("user", "pass")
+        access_token = self.login("user", "pass")
+
+        # Register the user who sends the message
+        other_user_id = self.register_user("otheruser", "pass")
+        other_access_token = self.login("otheruser", "pass")
+
+        # Register the pusher with disable_badge_count set to True
+        user_tuple = self.get_success(
+            self.hs.get_datastores().main.get_user_by_access_token(access_token)
+        )
+        assert user_tuple is not None
+        device_id = user_tuple.device_id
+
+        # Set the push data dict based on test input parameters
+        push_data: Dict[str, Any] = {
+            "url": "http://example.com/_matrix/push/v1/notify",
+        }
+        if disable_badge_count:
+            push_data["org.matrix.msc4076.disable_badge_count"] = True
+        if event_id_only:
+            push_data["format"] = "event_id_only"
+
+        self.get_success(
+            self.hs.get_pusherpool().add_or_update_pusher(
+                user_id=user_id,
+                device_id=device_id,
+                kind="http",
+                app_id="m.http",
+                app_display_name="HTTP Push Notifications",
+                device_display_name="pushy push",
+                pushkey="a@example.com",
+                lang=None,
+                data=push_data,
+            )
+        )
+
+        # Create a room
+        room = self.helper.create_room_as(user_id, tok=access_token)
+
+        # The other user joins
+        self.helper.join(room=room, user=other_user_id, tok=other_access_token)
+
+        # The other user sends a message
+        self.helper.send(room, body="Hi!", tok=other_access_token)
+
+        # Advance time a bit, so the pusher will register something has happened
+        self.pump()
+
+        # One push was attempted to be sent
+        self.assertEqual(len(self.push_attempts), 1)
+        self.assertEqual(
+            self.push_attempts[0][1], "http://example.com/_matrix/push/v1/notify"
+        )
+
+        if disable_badge_count:
+            # Verify that the notification DOESN'T contain a counts field
+            self.assertNotIn("counts", self.push_attempts[0][2]["notification"])
+        else:
+            # Ensure that the notification DOES contain a counts field
+            self.assertIn("counts", self.push_attempts[0][2]["notification"])
+            self.assertEqual(
+                self.push_attempts[0][2]["notification"]["counts"]["unread"], 1
+            )
+
+    def test_push_backoff(self) -> None:
+        """
+        The HTTP pusher will backoff correctly if it fails to contact the pusher.
+        """
+
+        # Register the user who gets notified
+        user_id = self.register_user("user", "pass")
+        access_token = self.login("user", "pass")
+
+        # Register the user who sends the message
+        other_user_id = self.register_user("otheruser", "pass")
+        other_access_token = self.login("otheruser", "pass")
+
+        # Register the pusher
+        user_tuple = self.get_success(
+            self.hs.get_datastores().main.get_user_by_access_token(access_token)
+        )
+        assert user_tuple is not None
+        device_id = user_tuple.device_id
+
+        self.get_success(
+            self.hs.get_pusherpool().add_or_update_pusher(
+                user_id=user_id,
+                device_id=device_id,
+                kind="http",
+                app_id="m.http",
+                app_display_name="HTTP Push Notifications",
+                device_display_name="pushy push",
+                pushkey="a@example.com",
+                lang=None,
+                data={"url": "http://example.com/_matrix/push/v1/notify"},
+            )
+        )
+
+        # Create a room with the other user
+        room = self.helper.create_room_as(user_id, tok=access_token)
+        self.helper.join(room=room, user=other_user_id, tok=other_access_token)
+
+        # The other user sends some messages
+        self.helper.send(room, body="Message 1", tok=other_access_token)
+
+        # One push was attempted to be sent
+        self.assertEqual(len(self.push_attempts), 1)
+        self.assertEqual(
+            self.push_attempts[0][1], "http://example.com/_matrix/push/v1/notify"
+        )
+        self.assertEqual(
+            self.push_attempts[0][2]["notification"]["content"]["body"], "Message 1"
+        )
+        self.push_attempts[0][0].callback({})
+        self.pump()
+
+        # Send another message, this time it fails
+        self.helper.send(room, body="Message 2", tok=other_access_token)
+        self.assertEqual(len(self.push_attempts), 2)
+        self.push_attempts[1][0].errback(Exception("couldn't connect"))
+        self.pump()
+
+        # Sending yet another message doesn't trigger a push immediately
+        self.helper.send(room, body="Message 3", tok=other_access_token)
+        self.pump()
+        self.assertEqual(len(self.push_attempts), 2)
+
+        # .. but waiting for a bit will cause more pushes
+        self.reactor.advance(10)
+        self.assertEqual(len(self.push_attempts), 3)
+        self.assertEqual(
+            self.push_attempts[2][2]["notification"]["content"]["body"], "Message 2"
+        )
+        self.push_attempts[2][0].callback({})
+        self.pump()
+
+        self.assertEqual(len(self.push_attempts), 4)
+        self.assertEqual(
+            self.push_attempts[3][2]["notification"]["content"]["body"], "Message 3"
+        )
+        self.push_attempts[3][0].callback({})

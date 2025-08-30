@@ -21,23 +21,29 @@
 import json
 import time
 import urllib.parse
+from http import HTTPStatus
 from typing import List, Optional
 from unittest.mock import AsyncMock, Mock
 
 from parameterized import parameterized
 
 from twisted.internet.task import deferLater
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 import synapse.rest.admin
 from synapse.api.constants import EventTypes, Membership, RoomTypes
 from synapse.api.errors import Codes
+from synapse.api.room_versions import RoomVersions
 from synapse.handlers.pagination import (
     PURGE_ROOM_ACTION_NAME,
     SHUTDOWN_AND_PURGE_ROOM_ACTION_NAME,
 )
 from synapse.rest.client import directory, events, knock, login, room, sync
 from synapse.server import HomeServer
+from synapse.storage.databases.main.purge_events import (
+    purge_room_tables_with_event_id_index,
+    purge_room_tables_with_room_id_column,
+)
 from synapse.types import UserID
 from synapse.util import Clock
 from synapse.util.task_scheduler import TaskScheduler
@@ -368,6 +374,47 @@ class DeleteRoomTestCase(unittest.HomeserverTestCase):
         self.assertEqual(200, channel.code, msg=channel.json_body)
         self._is_blocked(room_id)
 
+    def test_invited_users_not_joined_to_new_room(self) -> None:
+        """
+        Test that when a new room id is provided, users who are only invited
+        but have not joined original room are not moved to new room.
+        """
+        invitee = self.register_user("invitee", "pass")
+
+        self.helper.invite(
+            self.room_id, self.other_user, invitee, tok=self.other_user_tok
+        )
+
+        # verify that user is invited
+        channel = self.make_request(
+            "GET",
+            f"/_matrix/client/v3/rooms/{self.room_id}/members?membership=invite",
+            access_token=self.other_user_tok,
+        )
+        self.assertEqual(channel.code, 200)
+        self.assertEqual(len(channel.json_body["chunk"]), 1)
+        invite = channel.json_body["chunk"][0]
+        self.assertEqual(invite["state_key"], invitee)
+
+        # shutdown room
+        channel = self.make_request(
+            "DELETE",
+            self.url,
+            {"new_room_user_id": self.admin_user},
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+        self.assertEqual(len(channel.json_body["kicked_users"]), 2)
+
+        # joined member is moved to new room but invited user is not
+        users_in_room = self.get_success(
+            self.store.get_users_in_room(channel.json_body["new_room_id"])
+        )
+        self.assertNotIn(invitee, users_in_room)
+        self.assertIn(self.other_user, users_in_room)
+        self._is_purged(self.room_id)
+        self._has_no_members(self.room_id)
+
     def test_shutdown_room_consent(self) -> None:
         """Test that we can shutdown rooms with local users who have not
         yet accepted the privacy policy. This used to fail when we tried to
@@ -504,7 +551,7 @@ class DeleteRoomTestCase(unittest.HomeserverTestCase):
 
     def _is_purged(self, room_id: str) -> None:
         """Test that the following tables have been purged of all rows related to the room."""
-        for table in PURGE_TABLES:
+        for table in purge_room_tables_with_room_id_column:
             count = self.get_success(
                 self.store.db_pool.simple_select_one_onecol(
                     table=table,
@@ -513,7 +560,21 @@ class DeleteRoomTestCase(unittest.HomeserverTestCase):
                     desc="test_purge_room",
                 )
             )
+            self.assertEqual(count, 0, msg=f"Rows not purged in {table}")
 
+        for table in purge_room_tables_with_event_id_index:
+            rows = self.get_success(
+                self.store.db_pool.execute(
+                    "find_event_count_for_table",
+                    f"""
+                    SELECT COUNT(*) FROM {table} WHERE event_id IN (
+                        SELECT event_id FROM events WHERE room_id=?
+                    )
+                    """,
+                    room_id,
+                )
+            )
+            count = rows[0][0]
             self.assertEqual(count, 0, msg=f"Rows not purged in {table}")
 
     def _assert_peek(self, room_id: str, expect_code: int) -> None:
@@ -757,6 +818,8 @@ class DeleteRoomV2TestCase(unittest.HomeserverTestCase):
         self.assertEqual(2, len(channel.json_body["results"]))
         self.assertEqual("complete", channel.json_body["results"][0]["status"])
         self.assertEqual("complete", channel.json_body["results"][1]["status"])
+        self.assertEqual(self.room_id, channel.json_body["results"][0]["room_id"])
+        self.assertEqual(self.room_id, channel.json_body["results"][1]["room_id"])
         delete_ids = {delete_id1, delete_id2}
         self.assertTrue(channel.json_body["results"][0]["delete_id"] in delete_ids)
         delete_ids.remove(channel.json_body["results"][0]["delete_id"])
@@ -776,6 +839,7 @@ class DeleteRoomV2TestCase(unittest.HomeserverTestCase):
         self.assertEqual(1, len(channel.json_body["results"]))
         self.assertEqual("complete", channel.json_body["results"][0]["status"])
         self.assertEqual(delete_id2, channel.json_body["results"][0]["delete_id"])
+        self.assertEqual(self.room_id, channel.json_body["results"][0]["room_id"])
 
         # get status after more than clearing time for all tasks
         self.reactor.advance(TaskScheduler.KEEP_TASKS_FOR_MS / 1000 / 2)
@@ -1183,7 +1247,7 @@ class DeleteRoomV2TestCase(unittest.HomeserverTestCase):
 
     def _is_purged(self, room_id: str) -> None:
         """Test that the following tables have been purged of all rows related to the room."""
-        for table in PURGE_TABLES:
+        for table in purge_room_tables_with_room_id_column:
             count = self.get_success(
                 self.store.db_pool.simple_select_one_onecol(
                     table=table,
@@ -1192,7 +1256,21 @@ class DeleteRoomV2TestCase(unittest.HomeserverTestCase):
                     desc="test_purge_room",
                 )
             )
+            self.assertEqual(count, 0, msg=f"Rows not purged in {table}")
 
+        for table in purge_room_tables_with_event_id_index:
+            rows = self.get_success(
+                self.store.db_pool.execute(
+                    "find_event_count_for_table",
+                    f"""
+                    SELECT COUNT(*) FROM {table} WHERE event_id IN (
+                        SELECT event_id FROM events WHERE room_id=?
+                    )
+                    """,
+                    room_id,
+                )
+            )
+            count = rows[0][0]
             self.assertEqual(count, 0, msg=f"Rows not purged in {table}")
 
     def _assert_peek(self, room_id: str, expect_code: int) -> None:
@@ -1236,6 +1314,9 @@ class DeleteRoomV2TestCase(unittest.HomeserverTestCase):
         self.assertEqual(
             delete_id, channel_room_id.json_body["results"][0]["delete_id"]
         )
+        self.assertEqual(
+            self.room_id, channel_room_id.json_body["results"][0]["room_id"]
+        )
 
         # get information by delete_id
         channel_delete_id = self.make_request(
@@ -1248,6 +1329,7 @@ class DeleteRoomV2TestCase(unittest.HomeserverTestCase):
             channel_delete_id.code,
             msg=channel_delete_id.json_body,
         )
+        self.assertEqual(self.room_id, channel_delete_id.json_body["room_id"])
 
         # test values that are the same in both responses
         for content in [
@@ -1281,6 +1363,7 @@ class RoomTestCase(unittest.HomeserverTestCase):
         self.admin_user = self.register_user("admin", "pass", admin=True)
         self.admin_user_tok = self.login("admin", "pass")
 
+    @unittest.override_config({"room_list_publication_rules": [{"action": "allow"}]})
     def test_list_rooms(self) -> None:
         """Test that we can list rooms"""
         # Create 3 test rooms
@@ -1310,7 +1393,7 @@ class RoomTestCase(unittest.HomeserverTestCase):
         # Check that response json body contains a "rooms" key
         self.assertTrue(
             "rooms" in channel.json_body,
-            msg="Response body does not " "contain a 'rooms' key",
+            msg="Response body does not contain a 'rooms' key",
         )
 
         # Check that 3 rooms were returned
@@ -1794,6 +1877,85 @@ class RoomTestCase(unittest.HomeserverTestCase):
         self.assertEqual(room_id, channel.json_body["rooms"][0].get("room_id"))
         self.assertEqual("ж", channel.json_body["rooms"][0].get("name"))
 
+    @unittest.override_config({"room_list_publication_rules": [{"action": "allow"}]})
+    def test_filter_public_rooms(self) -> None:
+        self.helper.create_room_as(
+            self.admin_user, tok=self.admin_user_tok, is_public=True
+        )
+        self.helper.create_room_as(
+            self.admin_user, tok=self.admin_user_tok, is_public=True
+        )
+        self.helper.create_room_as(
+            self.admin_user, tok=self.admin_user_tok, is_public=False
+        )
+
+        response = self.make_request(
+            "GET",
+            "/_synapse/admin/v1/rooms",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, response.code, msg=response.json_body)
+        self.assertEqual(3, response.json_body["total_rooms"])
+        self.assertEqual(3, len(response.json_body["rooms"]))
+
+        response = self.make_request(
+            "GET",
+            "/_synapse/admin/v1/rooms?public_rooms=true",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, response.code, msg=response.json_body)
+        self.assertEqual(2, response.json_body["total_rooms"])
+        self.assertEqual(2, len(response.json_body["rooms"]))
+
+        response = self.make_request(
+            "GET",
+            "/_synapse/admin/v1/rooms?public_rooms=false",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, response.code, msg=response.json_body)
+        self.assertEqual(1, response.json_body["total_rooms"])
+        self.assertEqual(1, len(response.json_body["rooms"]))
+
+    def test_filter_empty_rooms(self) -> None:
+        self.helper.create_room_as(
+            self.admin_user, tok=self.admin_user_tok, is_public=True
+        )
+        self.helper.create_room_as(
+            self.admin_user, tok=self.admin_user_tok, is_public=True
+        )
+        room_id = self.helper.create_room_as(
+            self.admin_user, tok=self.admin_user_tok, is_public=False
+        )
+        self.helper.leave(room_id, self.admin_user, tok=self.admin_user_tok)
+
+        response = self.make_request(
+            "GET",
+            "/_synapse/admin/v1/rooms",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, response.code, msg=response.json_body)
+        self.assertEqual(3, response.json_body["total_rooms"])
+        self.assertEqual(3, len(response.json_body["rooms"]))
+
+        response = self.make_request(
+            "GET",
+            "/_synapse/admin/v1/rooms?empty_rooms=false",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, response.code, msg=response.json_body)
+        self.assertEqual(2, response.json_body["total_rooms"])
+        self.assertEqual(2, len(response.json_body["rooms"]))
+
+        response = self.make_request(
+            "GET",
+            "/_synapse/admin/v1/rooms?empty_rooms=true",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, response.code, msg=response.json_body)
+        self.assertEqual(1, response.json_body["total_rooms"])
+        self.assertEqual(1, len(response.json_body["rooms"]))
+
+    @unittest.override_config({"room_list_publication_rules": [{"action": "allow"}]})
     def test_single_room(self) -> None:
         """Test that a single room can be requested correctly"""
         # Create two test rooms
@@ -1956,6 +2118,52 @@ class RoomTestCase(unittest.HomeserverTestCase):
         # testing that the state events match is painful and not done here. We assume that
         # the create_room already does the right thing, so no need to verify that we got
         # the state events it created.
+
+    def test_room_state_param(self) -> None:
+        """Test that filtering by state event type works when requesting state"""
+        room_id = self.helper.create_room_as(self.admin_user, tok=self.admin_user_tok)
+
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{room_id}/state?type=m.room.member",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, channel.code)
+        state = channel.json_body["state"]
+        # only one member has joined so there should be one membership event
+        self.assertEqual(1, len(state))
+        event = state[0]
+        self.assertEqual(event["type"], "m.room.member")
+        self.assertEqual(event["state_key"], self.admin_user)
+
+    def test_room_state_param_empty(self) -> None:
+        """Test that passing an empty string as state filter param returns no state events"""
+        room_id = self.helper.create_room_as(self.admin_user, tok=self.admin_user_tok)
+
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{room_id}/state?type=",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, channel.code)
+        state = channel.json_body["state"]
+        self.assertEqual(5, len(state))
+
+    def test_room_state_param_not_in_room(self) -> None:
+        """
+        Test that passing a state filter param for a state event not in the room
+        returns no state events
+        """
+        room_id = self.helper.create_room_as(self.admin_user, tok=self.admin_user_tok)
+
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{room_id}/state?type=m.room.custom",
+            access_token=self.admin_user_tok,
+        )
+        self.assertEqual(200, channel.code)
+        state = channel.json_body["state"]
+        self.assertEqual(0, len(state))
 
     def _set_canonical_alias(
         self, room_id: str, test_alias: str, admin_user_tok: str
@@ -2189,6 +2397,33 @@ class RoomMessagesTestCase(unittest.HomeserverTestCase):
 
         chunk = channel.json_body["chunk"]
         self.assertEqual(len(chunk), 0, [event["content"] for event in chunk])
+
+    def test_room_message_filter_query_validation(self) -> None:
+        # Test json validation in (filter) query parameter.
+        # Does not test the validity of the filter, only the json validation.
+
+        # Check Get with valid json filter parameter, expect 200.
+        valid_filter_str = '{"types": ["m.room.message"]}'
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{self.room_id}/messages?dir=b&filter={valid_filter_str}",
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # Check Get with invalid json filter parameter, expect 400 NOT_JSON.
+        invalid_filter_str = "}}}{}"
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{self.room_id}/messages?dir=b&filter={invalid_filter_str}",
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.json_body)
+        self.assertEqual(
+            channel.json_body["errcode"], Codes.NOT_JSON, channel.json_body
+        )
 
 
 class JoinAliasRoomTestCase(unittest.HomeserverTestCase):
@@ -2522,6 +2757,39 @@ class JoinAliasRoomTestCase(unittest.HomeserverTestCase):
             else:
                 self.fail("Event %s from events_after not found" % j)
 
+    def test_room_event_context_filter_query_validation(self) -> None:
+        # Test json validation in (filter) query parameter.
+        # Does not test the validity of the filter, only the json validation.
+
+        # Create a user with room and event_id.
+        user_id = self.register_user("test", "test")
+        user_tok = self.login("test", "test")
+        room_id = self.helper.create_room_as(user_id, tok=user_tok)
+        event_id = self.helper.send(room_id, "message 1", tok=user_tok)["event_id"]
+
+        # Check Get with valid json filter parameter, expect 200.
+        valid_filter_str = '{"types": ["m.room.message"]}'
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{room_id}/context/{event_id}?filter={valid_filter_str}",
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(channel.code, HTTPStatus.OK, channel.json_body)
+
+        # Check Get with invalid json filter parameter, expect 400 NOT_JSON.
+        invalid_filter_str = "}}}{}"
+        channel = self.make_request(
+            "GET",
+            f"/_synapse/admin/v1/rooms/{room_id}/context/{event_id}?filter={invalid_filter_str}",
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(channel.code, HTTPStatus.BAD_REQUEST, channel.json_body)
+        self.assertEqual(
+            channel.json_body["errcode"], Codes.NOT_JSON, channel.json_body
+        )
+
 
 class MakeRoomAdminTestCase(unittest.HomeserverTestCase):
     servlets = [
@@ -2656,6 +2924,63 @@ class MakeRoomAdminTestCase(unittest.HomeserverTestCase):
             channel.json_body["error"],
             "No local admin user in room with power to update power levels.",
         )
+
+    def test_v12_room(self) -> None:
+        """Test that you can be promoted to admin in v12 rooms which won't have the admin the PL event."""
+        room_id = self.helper.create_room_as(
+            self.creator,
+            tok=self.creator_tok,
+            room_version=RoomVersions.V12.identifier,
+        )
+
+        channel = self.make_request(
+            "POST",
+            f"/_synapse/admin/v1/rooms/{room_id}/make_room_admin",
+            content={},
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+
+        # Now we test that we can join the room and that the admin user has PL 100.
+        self.helper.join(room_id, self.admin_user, tok=self.admin_user_tok)
+        pl = self.helper.get_state(
+            room_id, EventTypes.PowerLevels, tok=self.creator_tok
+        )
+        self.assertEquals(pl["users"][self.admin_user], 100)
+
+    def test_v12_room_with_many_user_pls(self) -> None:
+        """Test that you can be promoted to the admin user's PL in v12 rooms that contain a range of user PLs."""
+        room_id = self.helper.create_room_as(
+            self.creator,
+            tok=self.creator_tok,
+            room_version=RoomVersions.V12.identifier,
+            is_public=True,
+            extra_content={
+                "power_level_content_override": {
+                    "users": {
+                        self.second_user_id: 50,
+                    },
+                },
+            },
+        )
+
+        self.helper.join(room_id, self.admin_user, tok=self.admin_user_tok)
+        self.helper.join(room_id, self.second_user_id, tok=self.second_tok)
+
+        channel = self.make_request(
+            "POST",
+            f"/_synapse/admin/v1/rooms/{room_id}/make_room_admin",
+            content={},
+            access_token=self.admin_user_tok,
+        )
+
+        self.assertEqual(200, channel.code, msg=channel.json_body)
+
+        pl = self.helper.get_state(
+            room_id, EventTypes.PowerLevels, tok=self.creator_tok
+        )
+        self.assertEquals(pl["users"][self.admin_user], 100)
 
 
 class BlockRoomTestCase(unittest.HomeserverTestCase):
@@ -2884,35 +3209,3 @@ class BlockRoomTestCase(unittest.HomeserverTestCase):
         """Block a room in database"""
         self.get_success(self._store.block_room(room_id, self.other_user))
         self._is_blocked(room_id, expect=True)
-
-
-PURGE_TABLES = [
-    "current_state_events",
-    "event_backward_extremities",
-    "event_forward_extremities",
-    "event_json",
-    "event_push_actions",
-    "event_search",
-    "events",
-    "receipts_graph",
-    "receipts_linearized",
-    "room_aliases",
-    "room_depth",
-    "room_memberships",
-    "room_stats_state",
-    "room_stats_current",
-    "room_stats_earliest_token",
-    "rooms",
-    "stream_ordering_to_exterm",
-    "users_in_public_rooms",
-    "users_who_share_private_rooms",
-    "appservice_room_list",
-    "e2e_room_keys",
-    "event_push_summary",
-    "pusher_throttle",
-    "room_account_data",
-    "room_tags",
-    # "state_groups",  # Current impl leaves orphaned state groups around.
-    "state_groups_state",
-    "federation_inbound_events_staging",
-]

@@ -22,7 +22,7 @@
 import secrets
 from typing import Generator, List, Tuple, cast
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.server import HomeServer
 from synapse.util import Clock
@@ -103,6 +103,24 @@ class UpdateUpsertManyTests(unittest.HomeserverTestCase):
                 key_values,
                 value_names,
                 value_values,
+            )
+        )
+
+        # Check results are what we expect
+        self.assertEqual(
+            set(self._dump_table_to_tuple()),
+            {(1, "user1", "hello"), (2, "user2", "bleb")},
+        )
+
+        self.get_success(
+            self.storage.db_pool.runInteraction(
+                "test",
+                self.storage.db_pool.simple_upsert_many_txn,
+                self.table_name,
+                key_names=key_names,
+                key_values=[[2, "user2"]],
+                value_names=[],
+                value_values=[],
             )
         )
 

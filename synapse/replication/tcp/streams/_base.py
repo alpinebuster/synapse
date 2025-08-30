@@ -247,7 +247,7 @@ class _StreamFromIdGen(Stream):
 
 
 def current_token_without_instance(
-    current_token: Callable[[], int]
+    current_token: Callable[[], int],
 ) -> Callable[[str], int]:
     """Takes a current token callback function for a single writer stream
     that doesn't take an instance name parameter and wraps it in a function that
@@ -549,9 +549,13 @@ class DeviceListsStream(_StreamFromIdGen):
 
     @attr.s(slots=True, frozen=True, auto_attribs=True)
     class DeviceListsStreamRow:
-        entity: str
+        user_id: str
         # Indicates that a user has signed their own device with their user-signing key
         is_signature: bool
+
+        # Indicates if this is a notification that we've calculated the hosts we
+        # need to send the update to.
+        hosts_calculated: bool
 
     NAME = "device_lists"
     ROW_TYPE = DeviceListsStreamRow
@@ -594,13 +598,13 @@ class DeviceListsStream(_StreamFromIdGen):
             upper_limit_token = min(upper_limit_token, signatures_to_token)
 
         device_updates = [
-            (stream_id, (entity, False))
-            for stream_id, (entity,) in device_updates
+            (stream_id, (entity, False, hosts))
+            for stream_id, (entity, hosts) in device_updates
             if stream_id <= upper_limit_token
         ]
 
         signatures_updates = [
-            (stream_id, (entity, True))
+            (stream_id, (entity, True, False))
             for stream_id, (entity,) in signatures_updates
             if stream_id <= upper_limit_token
         ]
@@ -719,3 +723,46 @@ class AccountDataStream(_StreamFromIdGen):
             heapq.merge(room_rows, global_rows, tag_rows, key=lambda row: row[0])
         )
         return updates, to_token, limited
+
+
+class ThreadSubscriptionsStream(_StreamFromIdGen):
+    """A thread subscription was changed."""
+
+    @attr.s(slots=True, auto_attribs=True)
+    class ThreadSubscriptionsStreamRow:
+        """Stream to inform workers about changes to thread subscriptions."""
+
+        user_id: str
+        room_id: str
+        event_id: str  # The event ID of the thread root
+
+    NAME = "thread_subscriptions"
+    ROW_TYPE = ThreadSubscriptionsStreamRow
+
+    def __init__(self, hs: "HomeServer"):
+        self.store = hs.get_datastores().main
+        super().__init__(
+            hs.get_instance_name(),
+            self._update_function,
+            self.store._thread_subscriptions_id_gen,
+        )
+
+    async def _update_function(
+        self, instance_name: str, from_token: int, to_token: int, limit: int
+    ) -> StreamUpdateResult:
+        updates = await self.store.get_updated_thread_subscriptions(
+            from_id=from_token, to_id=to_token, limit=limit
+        )
+        rows = [
+            (
+                stream_id,
+                # These are the args to `ThreadSubscriptionsStreamRow`
+                (user_id, room_id, event_id),
+            )
+            for stream_id, user_id, room_id, event_id in updates
+        ]
+
+        if not rows:
+            return [], to_token, False
+
+        return rows, rows[-1][0], len(updates) == limit

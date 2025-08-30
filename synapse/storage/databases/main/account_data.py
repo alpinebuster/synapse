@@ -34,8 +34,10 @@ from typing import (
 )
 
 from synapse.api.constants import AccountDataTypes
+from synapse.api.errors import Codes, SynapseError
 from synapse.replication.tcp.streams import AccountDataStream
 from synapse.storage._base import db_to_json
+from synapse.storage.admin_client_config import AdminClientConfig
 from synapse.storage.database import (
     DatabasePool,
     LoggingDatabaseConnection,
@@ -43,12 +45,8 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.push_rule import PushRulesWorkerStore
-from synapse.storage.engines import PostgresEngine
-from synapse.storage.util.id_generators import (
-    AbstractStreamIdGenerator,
-    MultiWriterIdGenerator,
-    StreamIdGenerator,
-)
+from synapse.storage.invite_rule import InviteRulesConfig
+from synapse.storage.util.id_generators import MultiWriterIdGenerator
 from synapse.types import JsonDict, JsonMapping
 from synapse.util import json_encoder
 from synapse.util.caches.descriptors import cached
@@ -73,43 +71,29 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
             self._instance_name in hs.config.worker.writers.account_data
         )
 
-        self._account_data_id_gen: AbstractStreamIdGenerator
+        self._account_data_id_gen: MultiWriterIdGenerator
 
-        if isinstance(database.engine, PostgresEngine):
-            self._account_data_id_gen = MultiWriterIdGenerator(
-                db_conn=db_conn,
-                db=database,
-                notifier=hs.get_replication_notifier(),
-                stream_name="account_data",
-                instance_name=self._instance_name,
-                tables=[
-                    ("room_account_data", "instance_name", "stream_id"),
-                    ("room_tags_revisions", "instance_name", "stream_id"),
-                    ("account_data", "instance_name", "stream_id"),
-                ],
-                sequence_name="account_data_sequence",
-                writers=hs.config.worker.writers.account_data,
-            )
-        else:
-            # Multiple writers are not supported for SQLite.
-            #
-            # We shouldn't be running in worker mode with SQLite, but its useful
-            # to support it for unit tests.
-            self._account_data_id_gen = StreamIdGenerator(
-                db_conn,
-                hs.get_replication_notifier(),
-                "room_account_data",
-                "stream_id",
-                extra_tables=[
-                    ("account_data", "stream_id"),
-                    ("room_tags_revisions", "stream_id"),
-                ],
-                is_writer=self._instance_name in hs.config.worker.writers.account_data,
-            )
+        self._account_data_id_gen = MultiWriterIdGenerator(
+            db_conn=db_conn,
+            db=database,
+            notifier=hs.get_replication_notifier(),
+            stream_name="account_data",
+            server_name=self.server_name,
+            instance_name=self._instance_name,
+            tables=[
+                ("room_account_data", "instance_name", "stream_id"),
+                ("room_tags_revisions", "instance_name", "stream_id"),
+                ("account_data", "instance_name", "stream_id"),
+            ],
+            sequence_name="account_data_sequence",
+            writers=hs.config.worker.writers.account_data,
+        )
 
         account_max = self.get_max_account_data_stream_id()
         self._account_data_stream_cache = StreamChangeCache(
-            "AccountDataAndTagsChangeCache", account_max
+            name="AccountDataAndTagsChangeCache",
+            server_name=self.server_name,
+            current_stream_pos=account_max,
         )
 
         self.db_pool.updates.register_background_index_update(
@@ -124,6 +108,8 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
             self._delete_account_data_for_deactivated_users,
         )
 
+        self._msc4155_enabled = hs.config.experimental.msc4155_enabled
+
     def get_max_account_data_stream_id(self) -> int:
         """Get the current max stream ID for account data stream
 
@@ -131,6 +117,9 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
             int
         """
         return self._account_data_id_gen.get_current_token()
+
+    def get_account_data_id_generator(self) -> MultiWriterIdGenerator:
+        return self._account_data_id_gen
 
     @cached()
     async def get_global_account_data_for_user(
@@ -196,7 +185,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
 
         def get_room_account_data_for_user_txn(
             txn: LoggingTransaction,
-        ) -> Dict[str, Dict[str, JsonDict]]:
+        ) -> Dict[str, Dict[str, JsonMapping]]:
             # The 'content != '{}' condition below prevents us from using
             # `simple_select_list_txn` here, as it doesn't support conditions
             # other than 'equals'.
@@ -213,7 +202,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
 
             txn.execute(sql, (user_id,))
 
-            by_room: Dict[str, Dict[str, JsonDict]] = {}
+            by_room: Dict[str, Dict[str, JsonMapping]] = {}
             for room_id, account_data_type, content in txn:
                 room_data = by_room.setdefault(room_id, {})
 
@@ -413,7 +402,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
 
     async def get_updated_global_account_data_for_user(
         self, user_id: str, stream_id: int
-    ) -> Mapping[str, JsonMapping]:
+    ) -> Dict[str, JsonMapping]:
         """Get all the global account_data that's changed for a user.
 
         Args:
@@ -426,7 +415,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
 
         def get_updated_global_account_data_for_user(
             txn: LoggingTransaction,
-        ) -> Dict[str, JsonDict]:
+        ) -> Dict[str, JsonMapping]:
             sql = """
                 SELECT account_data_type, content FROM account_data
                 WHERE user_id = ? AND stream_id > ?
@@ -448,7 +437,7 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
 
     async def get_updated_room_account_data_for_user(
         self, user_id: str, stream_id: int
-    ) -> Dict[str, Dict[str, JsonDict]]:
+    ) -> Dict[str, Dict[str, JsonMapping]]:
         """Get all the room account_data that's changed for a user.
 
         Args:
@@ -461,14 +450,14 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
 
         def get_updated_room_account_data_for_user_txn(
             txn: LoggingTransaction,
-        ) -> Dict[str, Dict[str, JsonDict]]:
+        ) -> Dict[str, Dict[str, JsonMapping]]:
             sql = """
                 SELECT room_id, account_data_type, content FROM room_account_data
                 WHERE user_id = ? AND stream_id > ?
             """
             txn.execute(sql, (user_id, stream_id))
 
-            account_data_by_room: Dict[str, Dict[str, JsonDict]] = {}
+            account_data_by_room: Dict[str, Dict[str, JsonMapping]] = {}
             for row in txn:
                 room_account_data = account_data_by_room.setdefault(row[0], {})
                 room_account_data[row[1]] = db_to_json(row[2])
@@ -484,6 +473,56 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
         return await self.db_pool.runInteraction(
             "get_updated_room_account_data_for_user",
             get_updated_room_account_data_for_user_txn,
+        )
+
+    async def get_updated_room_account_data_for_user_for_room(
+        self,
+        # Since there are multiple arguments with the same type, force keyword arguments
+        # so people don't accidentally swap the order
+        *,
+        user_id: str,
+        room_id: str,
+        from_stream_id: int,
+        to_stream_id: int,
+    ) -> Dict[str, JsonMapping]:
+        """Get the room account_data that's changed for a user in a room.
+
+        (> `from_stream_id` and <= `to_stream_id`)
+
+        Args:
+            user_id: The user to get the account_data for.
+            room_id: The room to check
+            from_stream_id: The point in the stream to fetch from
+            to_stream_id: The point in the stream to fetch to
+
+        Returns:
+            A dict of the room account data.
+        """
+
+        def get_updated_room_account_data_for_user_for_room_txn(
+            txn: LoggingTransaction,
+        ) -> Dict[str, JsonMapping]:
+            sql = """
+                SELECT account_data_type, content FROM room_account_data
+                WHERE user_id = ? AND room_id = ? AND stream_id > ? AND stream_id <= ?
+            """
+            txn.execute(sql, (user_id, room_id, from_stream_id, to_stream_id))
+
+            room_account_data: Dict[str, JsonMapping] = {}
+            for row in txn:
+                room_account_data[row[0]] = db_to_json(row[1])
+
+            return room_account_data
+
+        changed = self._account_data_stream_cache.has_entity_changed(
+            user_id, int(from_stream_id)
+        )
+        if not changed:
+            return {}
+
+        return await self.db_pool.runInteraction(
+            "get_updated_room_account_data_for_user_for_room",
+            get_updated_room_account_data_for_user_for_room_txn,
         )
 
     @cached(max_entries=5000, iterable=True)
@@ -525,6 +564,38 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
                 desc="ignored_users",
             )
         )
+
+    async def get_invite_config_for_user(self, user_id: str) -> InviteRulesConfig:
+        """
+        Get the invite configuration for the current user.
+
+        Args:
+            user_id:
+        """
+
+        if not self._msc4155_enabled:
+            # This equates to allowing all invites, as if the setting was off.
+            return InviteRulesConfig(None)
+
+        data = await self.get_global_account_data_by_type_for_user(
+            user_id, AccountDataTypes.MSC4155_INVITE_PERMISSION_CONFIG
+        )
+        return InviteRulesConfig(data)
+
+    async def get_admin_client_config_for_user(self, user_id: str) -> AdminClientConfig:
+        """
+        Get the admin client configuration for the specified user.
+
+        The admin client config contains Synapse-specific settings that clients running
+        server admin accounts can use. They have no effect on non-admin users.
+
+        Args:
+            user_id: The user ID to get config for.
+        """
+        data = await self.get_global_account_data_by_type_for_user(
+            user_id, AccountDataTypes.SYNAPSE_ADMIN_CLIENT_CONFIG
+        )
+        return AdminClientConfig(data)
 
     def process_replication_rows(
         self,
@@ -728,6 +799,9 @@ class AccountDataWorkerStore(PushRulesWorkerStore, CacheInvalidationWorkerStore)
             currently_ignored_users = set(ignored_users_content)
         else:
             currently_ignored_users = set()
+
+        if user_id in currently_ignored_users:
+            raise SynapseError(400, "You cannot ignore yourself", Codes.INVALID_PARAM)
 
         # If the data has not changed, nothing to do.
         if previously_ignored_users == currently_ignored_users:

@@ -24,8 +24,13 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional, Set
 
 from twisted.python.failure import Failure
 
-from synapse.logging.context import nested_logging_context
-from synapse.metrics import LaterGauge
+from synapse.logging.context import (
+    ContextResourceUsage,
+    LoggingContext,
+    nested_logging_context,
+    set_current_context,
+)
+from synapse.metrics import SERVER_NAME_LABEL, LaterGauge
 from synapse.metrics.background_process_metrics import (
     run_as_background_process,
     wrap_as_background_process,
@@ -41,33 +46,43 @@ logger = logging.getLogger(__name__)
 
 class TaskScheduler:
     """
-    This is a simple task sheduler aimed at resumable tasks: usually we use `run_in_background`
-    to launch a background task, or Twisted `deferLater` if we want to do so later on.
+    This is a simple task scheduler designed for resumable tasks. Normally,
+    you'd use `run_in_background` to start a background task or Twisted's
+    `deferLater` if you want to run it later.
 
-    The problem with that is that the tasks will just stop and never be resumed if synapse
-    is stopped for whatever reason.
+    The issue is that these tasks stop completely and won't resume if Synapse is
+    shut down for any reason.
 
-    How this works:
-    - A function mapped to a named action should first be registered with `register_action`.
-    This function will be called when trying to resuming tasks after a synapse shutdown,
-    so this registration should happen when synapse is initialised, NOT right before scheduling
-    a task.
-    - A task can then be launched using this named action with `schedule_task`. A `params` dict
-    can be passed, and it will be available to the registered function when launched. This task
-    can be launch either now-ish, or later on by giving a `timestamp` parameter.
+    Here's how it works:
 
-    The function may call `update_task` at any time to update the `result` of the task,
-    and this can be used to resume the task at a specific point and/or to convey a result to
-    the code launching the task.
-    You can also specify the `result` (and/or an `error`) when returning from the function.
+    - Register an Action: First, you need to register a function to a named
+      action using `register_action`. This function will be called to resume tasks
+      after a Synapse shutdown. Make sure to register it when Synapse initializes,
+      not right before scheduling the task.
 
-    The reconciliation loop runs every minute, so this is not a precise scheduler.
-    There is a limit of 10 concurrent tasks, so tasks may be delayed if the pool is already
-    full. In this regard, please take great care that scheduled tasks can actually finished.
-    For now there is no mechanism to stop a running task if it is stuck.
+    - Schedule a Task: You can launch a task linked to the named action
+      using `schedule_task`. You can pass a `params` dictionary, which will be
+      passed to the registered function when it's executed. Tasks can be scheduled
+      to run either immediately or later by specifying a `timestamp`.
 
-    Tasks will be run on the worker specified with `run_background_tasks_on` config,
-    or the main one by default.
+    - Update Task: The function handling the task can call `update_task` at
+      any point to update the task's `result`. This lets you resume the task from
+      a specific point or pass results back to the code that scheduled it. When
+      the function completes, you can also return a `result` or an `error`.
+
+    Things to keep in mind:
+
+    - The reconciliation loop runs every minute, so this is not a high-precision
+      scheduler.
+
+    - Only 10 tasks can run at the same time. If the pool is full, tasks may be
+      delayed. Make sure your scheduled tasks can actually finish.
+
+    - Currently, there's no way to stop a task if it gets stuck.
+
+    - Tasks will run on the worker defined by the `run_background_tasks_on`
+      setting in your configuration. If no worker is specified, they'll run on
+      the main one by default.
     """
 
     # Precision of the scheduler, evaluation of tasks to run will only happen
@@ -81,9 +96,14 @@ class TaskScheduler:
     MAX_CONCURRENT_RUNNING_TASKS = 5
     # Time from the last task update after which we will log a warning
     LAST_UPDATE_BEFORE_WARNING_MS = 24 * 60 * 60 * 1000  # 24hrs
+    # Report a running task's status and usage every so often.
+    OCCASIONAL_REPORT_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
 
     def __init__(self, hs: "HomeServer"):
         self._hs = hs
+        self.server_name = (
+            hs.hostname
+        )  # nb must be called this for @wrap_as_background_process
         self._store = hs.get_datastores().main
         self._clock = hs.get_clock()
         self._running_tasks: Set[str] = set()
@@ -111,10 +131,10 @@ class TaskScheduler:
             )
 
         LaterGauge(
-            "synapse_scheduler_running_tasks",
-            "The number of concurrent running tasks handled by the TaskScheduler",
-            labels=None,
-            caller=lambda: len(self._running_tasks),
+            name="synapse_scheduler_running_tasks",
+            desc="The number of concurrent running tasks handled by the TaskScheduler",
+            labelnames=[SERVER_NAME_LABEL],
+            caller=lambda: {(self.server_name,): len(self._running_tasks)},
         )
 
     def register_action(
@@ -150,7 +170,7 @@ class TaskScheduler:
         params: Optional[JsonMapping] = None,
     ) -> str:
         """Schedule a new potentially resumable task. A function matching the specified
-        `action` should have be registered with `register_action` before the task is run.
+        `action` should've been registered with `register_action` before the task is run.
 
         Args:
             action: the name of a previously registered action
@@ -167,9 +187,10 @@ class TaskScheduler:
             The id of the scheduled task
         """
         status = TaskStatus.SCHEDULED
+        start_now = False
         if timestamp is None or timestamp < self._clock.time_msec():
             timestamp = self._clock.time_msec()
-            status = TaskStatus.ACTIVE
+            start_now = True
 
         task = ScheduledTask(
             random_string(16),
@@ -183,9 +204,11 @@ class TaskScheduler:
         )
         await self._store.insert_scheduled_task(task)
 
-        if status == TaskStatus.ACTIVE:
+        # If the task is ready to run immediately, run the scheduling algorithm now
+        # rather than waiting
+        if start_now:
             if self._run_background_tasks:
-                await self._launch_task(task)
+                self._launch_scheduled_tasks()
             else:
                 self._hs.get_replication_command_handler().send_new_active_task(task.id)
 
@@ -200,15 +223,15 @@ class TaskScheduler:
         result: Optional[JsonMapping] = None,
         error: Optional[str] = None,
     ) -> bool:
-        """Update some task associated values. This is exposed publicly so it can
-        be used inside task functions, mainly to update the result and be able to
-        resume a task at a specific step after a restart of synapse.
+        """Update some task-associated values. This is exposed publicly so it can
+        be used inside task functions, mainly to update the result or resume
+        a task at a specific step after a restart of synapse.
 
         It can also be used to stage a task, by setting the `status` to `SCHEDULED` with
         a new timestamp.
 
-        The `status` can only be set to `ACTIVE` or `SCHEDULED`, `COMPLETE` and `FAILED`
-        are terminal status and can only be set by returning it in the function.
+        The `status` can only be set to `ACTIVE` or `SCHEDULED`. `COMPLETE` and `FAILED`
+        are terminal statuses and can only be set by returning them from the function.
 
         Args:
             id: the id of the task to update
@@ -216,6 +239,12 @@ class TaskScheduler:
             status: the new `TaskStatus` of the task
             result: the new result of the task
             error: the new error of the task
+
+        Returns:
+            True if the update was successful, False otherwise.
+
+        Raises:
+            Exception: If a status other than `ACTIVE` or `SCHEDULED` was passed.
         """
         if status == TaskStatus.COMPLETE or status == TaskStatus.FAILED:
             raise Exception(
@@ -253,9 +282,9 @@ class TaskScheduler:
         max_timestamp: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> List[ScheduledTask]:
-        """Get a list of tasks. Returns all the tasks if no args is provided.
+        """Get a list of tasks. Returns all the tasks if no args are provided.
 
-        If an arg is `None` all tasks matching the other args will be selected.
+        If an arg is `None`, all tasks matching the other args will be selected.
         If an arg is an empty list, the corresponding value of the task needs
         to be `None` to be selected.
 
@@ -267,8 +296,8 @@ class TaskScheduler:
                 a timestamp inferior to the specified one
             limit: Only return `limit` number of rows if set.
 
-        Returns
-            A list of `ScheduledTask`, ordered by increasing timestamps
+        Returns:
+            A list of `ScheduledTask`, ordered by increasing timestamps.
         """
         return await self._store.get_scheduled_tasks(
             actions=actions,
@@ -293,23 +322,13 @@ class TaskScheduler:
             raise Exception(f"Task {id} is currently ACTIVE and can't be deleted")
         await self._store.delete_scheduled_task(id)
 
-    def launch_task_by_id(self, id: str) -> None:
-        """Try launching the task with the given ID."""
-        # Don't bother trying to launch new tasks if we're already at capacity.
-        if len(self._running_tasks) >= TaskScheduler.MAX_CONCURRENT_RUNNING_TASKS:
-            return
+    def on_new_task(self, task_id: str) -> None:
+        """Handle a notification that a new ready-to-run task has been added to the queue"""
+        # Just run the scheduler
+        self._launch_scheduled_tasks()
 
-        run_as_background_process("launch_task_by_id", self._launch_task_by_id, id)
-
-    async def _launch_task_by_id(self, id: str) -> None:
-        """Helper async function for `launch_task_by_id`."""
-        task = await self.get_task(id)
-        if task:
-            await self._launch_task(task)
-
-    @wrap_as_background_process("launch_scheduled_tasks")
-    async def _launch_scheduled_tasks(self) -> None:
-        """Retrieve and launch scheduled tasks that should be running at that time."""
+    def _launch_scheduled_tasks(self) -> None:
+        """Retrieve and launch scheduled tasks that should be running at this time."""
         # Don't bother trying to launch new tasks if we're already at capacity.
         if len(self._running_tasks) >= TaskScheduler.MAX_CONCURRENT_RUNNING_TASKS:
             return
@@ -319,20 +338,26 @@ class TaskScheduler:
 
         self._launching_new_tasks = True
 
-        try:
-            for task in await self.get_tasks(
-                statuses=[TaskStatus.ACTIVE], limit=self.MAX_CONCURRENT_RUNNING_TASKS
-            ):
-                await self._launch_task(task)
-            for task in await self.get_tasks(
-                statuses=[TaskStatus.SCHEDULED],
-                max_timestamp=self._clock.time_msec(),
-                limit=self.MAX_CONCURRENT_RUNNING_TASKS,
-            ):
-                await self._launch_task(task)
+        async def inner() -> None:
+            try:
+                for task in await self.get_tasks(
+                    statuses=[TaskStatus.ACTIVE],
+                    limit=self.MAX_CONCURRENT_RUNNING_TASKS,
+                ):
+                    # _launch_task will ignore tasks that we're already running, and
+                    # will also do nothing if we're already at the maximum capacity.
+                    await self._launch_task(task)
+                for task in await self.get_tasks(
+                    statuses=[TaskStatus.SCHEDULED],
+                    max_timestamp=self._clock.time_msec(),
+                    limit=self.MAX_CONCURRENT_RUNNING_TASKS,
+                ):
+                    await self._launch_task(task)
 
-        finally:
-            self._launching_new_tasks = False
+            finally:
+                self._launching_new_tasks = False
+
+        run_as_background_process("launch_scheduled_tasks", self.server_name, inner)
 
     @wrap_as_background_process("clean_scheduled_tasks")
     async def _clean_scheduled_tasks(self) -> None:
@@ -345,6 +370,33 @@ class TaskScheduler:
             # FAILED and COMPLETE tasks should never be running
             assert task.id not in self._running_tasks
             await self._store.delete_scheduled_task(task.id)
+
+    @staticmethod
+    def _log_task_usage(
+        state: str, task: ScheduledTask, usage: ContextResourceUsage, active_time: float
+    ) -> None:
+        """
+        Log a line describing the state and usage of a task.
+        The log line is inspired by / a copy of the request log line format,
+        but with irrelevant fields removed.
+
+        active_time: Time that the task has been running for, in seconds.
+        """
+
+        logger.info(
+            "Task %s: %.3fsec (%.3fsec, %.3fsec) (%.3fsec/%.3fsec/%d)"
+            " [%d dbevts] %r, %r",
+            state,
+            active_time,
+            usage.ru_utime,
+            usage.ru_stime,
+            usage.db_sched_duration_sec,
+            usage.db_txn_duration_sec,
+            int(usage.db_txn_count),
+            usage.evt_db_fetch_count,
+            task.resource_id,
+            task.params,
+        )
 
     async def _launch_task(self, task: ScheduledTask) -> None:
         """Launch a scheduled task now.
@@ -360,14 +412,39 @@ class TaskScheduler:
             )
         function = self._actions[task.action]
 
+        def _occasional_report(
+            task_log_context: LoggingContext, start_time: float
+        ) -> None:
+            """
+            Helper to log a 'Task continuing' line every so often.
+            """
+
+            current_time = self._clock.time()
+            calling_context = set_current_context(task_log_context)
+            try:
+                usage = task_log_context.get_resource_usage()
+                TaskScheduler._log_task_usage(
+                    "continuing", task, usage, current_time - start_time
+                )
+            finally:
+                set_current_context(calling_context)
+
         async def wrapper() -> None:
-            with nested_logging_context(task.id):
+            with nested_logging_context(task.id) as log_context:
+                start_time = self._clock.time()
+                occasional_status_call = self._clock.looping_call(
+                    _occasional_report,
+                    TaskScheduler.OCCASIONAL_REPORT_INTERVAL_MS,
+                    log_context,
+                    start_time,
+                )
                 try:
                     (status, result, error) = await function(task)
                 except Exception:
                     f = Failure()
                     logger.error(
-                        f"scheduled task {task.id} failed",
+                        "scheduled task %s failed",
+                        task.id,
                         exc_info=(f.type, f.value, f.getTracebackObject()),
                     )
                     status = TaskStatus.FAILED
@@ -383,6 +460,13 @@ class TaskScheduler:
                 )
                 self._running_tasks.remove(task.id)
 
+                current_time = self._clock.time()
+                usage = log_context.get_resource_usage()
+                TaskScheduler._log_task_usage(
+                    status.value, task, usage, current_time - start_time
+                )
+                occasional_status_call.stop()
+
             # Try launch a new task since we've finished with this one.
             self._clock.call_later(0.1, self._launch_scheduled_tasks)
 
@@ -393,8 +477,10 @@ class TaskScheduler:
             self._clock.time_msec()
             > task.timestamp + TaskScheduler.LAST_UPDATE_BEFORE_WARNING_MS
         ):
-            logger.warn(
-                f"Task {task.id} (action {task.action}) has seen no update for more than 24h and may be stuck"
+            logger.warning(
+                "Task %s (action %s) has seen no update for more than 24h and may be stuck",
+                task.id,
+                task.action,
             )
 
         if task.id in self._running_tasks:
@@ -402,4 +488,4 @@ class TaskScheduler:
 
         self._running_tasks.add(task.id)
         await self.update_task(task.id, status=TaskStatus.ACTIVE)
-        run_as_background_process(f"task-{task.action}", wrapper)
+        run_as_background_process(f"task-{task.action}", self.server_name, wrapper)

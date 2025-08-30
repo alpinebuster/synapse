@@ -78,6 +78,8 @@ class CasHandler:
         self._cas_displayname_attribute = hs.config.cas.cas_displayname_attribute
         self._cas_required_attributes = hs.config.cas.cas_required_attributes
         self._cas_enable_registration = hs.config.cas.cas_enable_registration
+        self._cas_allow_numeric_ids = hs.config.cas.cas_allow_numeric_ids
+        self._cas_numeric_ids_prefix = hs.config.cas.cas_numeric_ids_prefix
 
         self._http_client = hs.get_proxied_http_client()
 
@@ -188,6 +190,9 @@ class CasHandler:
         for child in root[0]:
             if child.tag.endswith("user"):
                 user = child.text
+                # if numeric user IDs are allowed and username is numeric then we add the prefix so Synapse can handle it
+                if self._cas_allow_numeric_ids and user is not None and user.isdigit():
+                    user = f"{self._cas_numeric_ids_prefix}{user}"
             if child.tag.endswith("attributes"):
                 for attribute in child:
                     # ElementTree library expands the namespace in
@@ -373,7 +378,8 @@ class CasHandler:
 
             # Arbitrarily use the first attribute found.
             display_name = cas_response.attributes.get(
-                self._cas_displayname_attribute, [None]
+                self._cas_displayname_attribute,  # type: ignore[arg-type]
+                [None],
             )[0]
 
             return UserAttributes(localpart=localpart, display_name=display_name)

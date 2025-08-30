@@ -22,10 +22,11 @@
 import datetime
 import os
 from typing import Any, Dict, List, Tuple
+from unittest.mock import AsyncMock
 
 import pkg_resources
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 import synapse.rest.admin
 from synapse.api.constants import (
@@ -38,10 +39,11 @@ from synapse.appservice import ApplicationService
 from synapse.rest.client import account, account_validity, login, logout, register, sync
 from synapse.server import HomeServer
 from synapse.storage._base import db_to_json
-from synapse.types import JsonDict
+from synapse.types import JsonDict, UserID
 from synapse.util import Clock
 
 from tests import unittest
+from tests.server import ThreadedMemoryReactorClock
 from tests.unittest import override_config
 
 
@@ -58,6 +60,13 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
         config["allow_guest_access"] = True
         return config
 
+    def make_homeserver(
+        self, reactor: ThreadedMemoryReactorClock, clock: Clock
+    ) -> HomeServer:
+        hs = super().make_homeserver(reactor, clock)
+        hs.get_send_email_handler()._sendmail = AsyncMock()
+        return hs
+
     def test_POST_appservice_registration_valid(self) -> None:
         user_id = "@as_user_kermit:test"
         as_token = "i_am_an_app_service"
@@ -66,7 +75,7 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
             as_token,
             id="1234",
             namespaces={"users": [{"regex": r"@as_user.*", "exclusive": True}]},
-            sender="@as:test",
+            sender=UserID.from_string("@as:test"),
         )
 
         self.hs.get_datastores().main.services_cache.append(appservice)
@@ -90,7 +99,7 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
             as_token,
             id="1234",
             namespaces={"users": [{"regex": r"@as_user.*", "exclusive": True}]},
-            sender="@as:test",
+            sender=UserID.from_string("@as:test"),
         )
 
         self.hs.get_datastores().main.services_cache.append(appservice)
@@ -110,6 +119,34 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
         )
 
         self.assertEqual(channel.code, 401, msg=channel.result)
+
+    def test_POST_appservice_msc4190_enabled(self) -> None:
+        # With MSC4190 enabled, the registration should *not* return an access token
+        user_id = "@as_user_kermit:test"
+        as_token = "i_am_an_app_service"
+
+        appservice = ApplicationService(
+            as_token,
+            id="1234",
+            namespaces={"users": [{"regex": r"@as_user.*", "exclusive": True}]},
+            sender=UserID.from_string("@as:test"),
+            msc4190_device_management=True,
+        )
+
+        self.hs.get_datastores().main.services_cache.append(appservice)
+        request_data = {
+            "username": "as_user_kermit",
+            "type": APP_SERVICE_REGISTRATION_TYPE,
+        }
+
+        channel = self.make_request(
+            b"POST", self.url + b"?access_token=i_am_an_app_service", request_data
+        )
+
+        self.assertEqual(channel.code, 200, msg=channel.result)
+        det_data = {"user_id": user_id, "home_server": self.hs.hostname}
+        self.assertLessEqual(det_data.items(), channel.json_body.items())
+        self.assertNotIn("access_token", channel.json_body)
 
     def test_POST_bad_password(self) -> None:
         request_data = {"username": "kermit", "password": 666}
@@ -1040,9 +1077,7 @@ class AccountValidityRenewalByEmailTestCase(unittest.HomeserverTestCase):
 
         # Check that the HTML we're getting is the one we expect when using an
         # invalid/unknown token.
-        expected_html = (
-            self.hs.config.account_validity.account_validity_invalid_token_template.render()
-        )
+        expected_html = self.hs.config.account_validity.account_validity_invalid_token_template.render()
         self.assertEqual(
             channel.result["body"], expected_html.encode("utf8"), channel.result
         )

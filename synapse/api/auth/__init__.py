@@ -18,18 +18,29 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
-from typing_extensions import Protocol
+from prometheus_client import Histogram
 
 from twisted.web.server import Request
 
 from synapse.appservice import ApplicationService
 from synapse.http.site import SynapseRequest
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.types import Requester
+
+if TYPE_CHECKING:
+    from synapse.rest.admin.experimental_features import ExperimentalFeature
 
 # guests always get this device id.
 GUEST_DEVICE_ID = "guest_device"
+
+
+introspection_response_timer = Histogram(
+    "synapse_api_auth_delegated_introspection_response",
+    "Time taken to get a response for an introspection request",
+    labelnames=["code", SERVER_NAME_LABEL],
+)
 
 
 class Auth(Protocol):
@@ -85,6 +96,19 @@ class Auth(Protocol):
             InvalidClientCredentialsError if no user by that token exists or the token
                 is invalid.
             AuthError if access is denied for the user in the access token
+        """
+
+    async def get_user_by_req_experimental_feature(
+        self,
+        request: SynapseRequest,
+        feature: "ExperimentalFeature",
+        allow_guest: bool = False,
+        allow_expired: bool = False,
+        allow_locked: bool = False,
+    ) -> Requester:
+        """Like `get_user_by_req`, except also checks if the user has access to
+        the experimental feature. If they don't returns a 404 unrecognized
+        request.
         """
 
     async def validate_appservice_can_control_user_id(

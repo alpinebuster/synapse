@@ -28,7 +28,7 @@ from unittest.mock import Mock
 import pkg_resources
 
 from twisted.internet.interfaces import IReactorTCP
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 import synapse.rest.admin
 from synapse.api.constants import LoginType, Membership
@@ -427,13 +427,23 @@ class PasswordResetTestCase(unittest.HomeserverTestCase):
         text = None
         for part in mail.walk():
             if part.get_content_type() == "text/plain":
-                text = part.get_payload(decode=True).decode("UTF-8")
+                text = part.get_payload(decode=True)
+                if text is not None:
+                    # According to the logic table in `get_payload`, we know that
+                    # the result of `get_payload` will be `bytes`, but mypy doesn't
+                    # know this and complains. Thus, we assert the type.
+                    assert isinstance(text, bytes)
+                    text = text.decode("UTF-8")
+
                 break
 
         if not text:
             self.fail("Could not find text portion of email to parse")
 
-        assert text is not None
+        # `text` must be a `str`, after being decoded and determined just above
+        # to not be `None` or an empty `str`.
+        assert isinstance(text, str)
+
         match = re.search(r"https://example.com\S+", text)
         assert match, "Could not find link in email"
 
@@ -754,10 +764,10 @@ class WhoamiTestCase(unittest.HomeserverTestCase):
         as_token = "i_am_an_app_service"
 
         appservice = ApplicationService(
-            as_token,
+            token=as_token,
             id="1234",
             namespaces={"users": [{"regex": user_id, "exclusive": True}]},
-            sender=user_id,
+            sender=UserID.from_string(user_id),
         )
         self.hs.get_datastores().main.services_cache.append(appservice)
 
@@ -1209,13 +1219,23 @@ class ThreepidEmailRestTestCase(unittest.HomeserverTestCase):
         text = None
         for part in mail.walk():
             if part.get_content_type() == "text/plain":
-                text = part.get_payload(decode=True).decode("UTF-8")
+                text = part.get_payload(decode=True)
+                if text is not None:
+                    # According to the logic table in `get_payload`, we know that
+                    # the result of `get_payload` will be `bytes`, but mypy doesn't
+                    # know this and complains. Thus, we assert the type.
+                    assert isinstance(text, bytes)
+                    text = text.decode("UTF-8")
+
                 break
 
         if not text:
             self.fail("Could not find text portion of email to parse")
 
-        assert text is not None
+        # `text` must be a `str`, after being decoded and determined just above
+        # to not be `None` or an empty `str`.
+        assert isinstance(text, str)
+
         match = re.search(r"https://example.com\S+", text)
         assert match, "Could not find link in email"
 

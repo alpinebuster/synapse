@@ -19,6 +19,8 @@
 #
 #
 
+from typing import TYPE_CHECKING
+
 from packaging.version import Version
 
 try:
@@ -30,4 +32,73 @@ except ImportError:
 
 HAS_PYDANTIC_V2: bool = Version(pydantic_version).major == 2
 
-__all__ = ("HAS_PYDANTIC_V2",)
+if TYPE_CHECKING or HAS_PYDANTIC_V2:
+    from pydantic.v1 import (
+        AnyHttpUrl,
+        BaseModel,
+        Extra,
+        Field,
+        FilePath,
+        MissingError,
+        PydanticValueError,
+        StrictBool,
+        StrictInt,
+        StrictStr,
+        ValidationError,
+        conbytes,
+        confloat,
+        conint,
+        constr,
+        parse_obj_as,
+        root_validator,
+        validator,
+    )
+    from pydantic.v1.error_wrappers import ErrorWrapper
+    from pydantic.v1.typing import get_args
+else:
+    from pydantic import (
+        AnyHttpUrl,
+        BaseModel,
+        Extra,
+        Field,
+        FilePath,
+        MissingError,
+        PydanticValueError,
+        StrictBool,
+        StrictInt,
+        StrictStr,
+        ValidationError,
+        conbytes,
+        confloat,
+        conint,
+        constr,
+        parse_obj_as,
+        root_validator,
+        validator,
+    )
+    from pydantic.error_wrappers import ErrorWrapper
+    from pydantic.typing import get_args
+
+__all__ = (
+    "HAS_PYDANTIC_V2",
+    "AnyHttpUrl",
+    "BaseModel",
+    "constr",
+    "conbytes",
+    "conint",
+    "confloat",
+    "ErrorWrapper",
+    "Extra",
+    "Field",
+    "FilePath",
+    "get_args",
+    "MissingError",
+    "parse_obj_as",
+    "PydanticValueError",
+    "StrictBool",
+    "StrictInt",
+    "StrictStr",
+    "ValidationError",
+    "validator",
+    "root_validator",
+)

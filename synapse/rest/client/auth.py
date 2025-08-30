@@ -24,10 +24,11 @@ from typing import TYPE_CHECKING
 
 from twisted.web.server import Request
 
+from synapse.api.auth.mas import MasDelegatedAuth
 from synapse.api.constants import LoginType
 from synapse.api.errors import LoginError, SynapseError
 from synapse.api.urls import CLIENT_API_PREFIX
-from synapse.http.server import HttpServer, respond_with_html
+from synapse.http.server import HttpServer, respond_with_html, respond_with_redirect
 from synapse.http.servlet import RestServlet, parse_string
 from synapse.http.site import SynapseRequest
 
@@ -65,6 +66,31 @@ class AuthRestServlet(RestServlet):
         session = parse_string(request, "session")
         if not session:
             raise SynapseError(400, "No session supplied")
+
+        if stagetype == "org.matrix.cross_signing_reset":
+            if self.hs.config.mas.enabled:
+                assert isinstance(self.auth, MasDelegatedAuth)
+
+                url = await self.auth.account_management_url()
+                url = f"{url}?action=org.matrix.cross_signing_reset"
+                return respond_with_redirect(
+                    request,
+                    url.encode(),
+                )
+
+            elif self.hs.config.experimental.msc3861.enabled:
+                # If MSC3861 is enabled, we can assume self._auth is an instance of MSC3861DelegatedAuth
+                # We import lazily here because of the authlib requirement
+                from synapse.api.auth.msc3861_delegated import MSC3861DelegatedAuth
+
+                assert isinstance(self.auth, MSC3861DelegatedAuth)
+
+                base = await self.auth.account_management_url()
+                if base is not None:
+                    url = f"{base}?action=org.matrix.cross_signing_reset"
+                else:
+                    url = await self.auth.issuer()
+                return respond_with_redirect(request, url.encode())
 
         if stagetype == LoginType.RECAPTCHA:
             html = self.recaptcha_template.render(

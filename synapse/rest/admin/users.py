@@ -27,11 +27,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import attr
 
-from synapse.api.constants import Direction, UserTypes
+from synapse._pydantic_compat import StrictBool, StrictInt, StrictStr
+from synapse.api.constants import Direction
 from synapse.api.errors import Codes, NotFoundError, SynapseError
 from synapse.http.servlet import (
     RestServlet,
     assert_params_in_dict,
+    parse_and_validate_json_object_from_request,
     parse_boolean,
     parse_enum,
     parse_integer,
@@ -40,6 +42,7 @@ from synapse.http.servlet import (
     parse_strings_from_args,
 )
 from synapse.http.site import SynapseRequest
+from synapse.logging.loggers import ExplicitlyConfiguredLogger
 from synapse.rest.admin._base import (
     admin_patterns,
     assert_requester_is_admin,
@@ -48,12 +51,33 @@ from synapse.rest.admin._base import (
 from synapse.rest.client._base import client_patterns
 from synapse.storage.databases.main.registration import ExternalIDReuseException
 from synapse.storage.databases.main.stats import UserSortOrder
-from synapse.types import JsonDict, JsonMapping, UserID
+from synapse.types import JsonDict, JsonMapping, TaskStatus, UserID
+from synapse.types.rest import RequestBodyModel
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
+
 logger = logging.getLogger(__name__)
+
+
+original_logger_class = logging.getLoggerClass()
+# Because this can log sensitive information, use a custom logger class that only allows
+# logging if the logger is explicitly configured.
+logging.setLoggerClass(ExplicitlyConfiguredLogger)
+user_registration_sensitive_debug_logger = logging.getLogger(
+    "synapse.rest.admin.users.registration_debug"
+)
+"""
+A logger for debugging the user registration process.
+
+Because this can log sensitive information (such as passwords and
+`registration_shared_secret`), we want people to explictly opt-in before seeing anything
+in the logs. Requires explicitly setting `synapse.rest.admin.users.registration_debug`
+in the logging configuration and does not inherit the log level from the parent logger.
+"""
+# Restore the original logger class
+logging.setLoggerClass(original_logger_class)
 
 
 class UsersRestServletV2(RestServlet):
@@ -85,7 +109,9 @@ class UsersRestServletV2(RestServlet):
         self.auth = hs.get_auth()
         self.admin_handler = hs.get_admin_handler()
         self._msc3866_enabled = hs.config.experimental.msc3866.enabled
-        self._msc3861_enabled = hs.config.experimental.msc3861.enabled
+        self._auth_delegation_enabled = (
+            hs.config.mas.enabled or hs.config.experimental.msc3861.enabled
+        )
 
     async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         await assert_requester_is_admin(self.auth, request)
@@ -93,28 +119,14 @@ class UsersRestServletV2(RestServlet):
         start = parse_integer(request, "from", default=0)
         limit = parse_integer(request, "limit", default=100)
 
-        if start < 0:
-            raise SynapseError(
-                HTTPStatus.BAD_REQUEST,
-                "Query parameter from must be a string representing a positive integer.",
-                errcode=Codes.INVALID_PARAM,
-            )
-
-        if limit < 0:
-            raise SynapseError(
-                HTTPStatus.BAD_REQUEST,
-                "Query parameter limit must be a string representing a positive integer.",
-                errcode=Codes.INVALID_PARAM,
-            )
-
         user_id = parse_string(request, "user_id")
         name = parse_string(request, "name", encoding="utf-8")
 
         guests = parse_boolean(request, "guests", default=True)
-        if self._msc3861_enabled and guests:
+        if self._auth_delegation_enabled and guests:
             raise SynapseError(
                 HTTPStatus.BAD_REQUEST,
-                "The guests parameter is not supported when MSC3861 is enabled.",
+                "The guests parameter is not supported when delegating to MAS.",
                 errcode=Codes.INVALID_PARAM,
             )
 
@@ -240,6 +252,7 @@ class UserRestServletV2(RestServlet):
         self.registration_handler = hs.get_registration_handler()
         self.pusher_pool = hs.get_pusherpool()
         self._msc3866_enabled = hs.config.experimental.msc3866.enabled
+        self._all_user_types = hs.config.user_types.all_user_types
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str
@@ -287,7 +300,7 @@ class UserRestServletV2(RestServlet):
                 assert_params_in_dict(external_id, ["auth_provider", "external_id"])
 
         user_type = body.get("user_type", None)
-        if user_type is not None and user_type not in UserTypes.ALL_USER_TYPES:
+        if user_type is not None and user_type not in self._all_user_types:
             raise SynapseError(HTTPStatus.BAD_REQUEST, "Invalid user type")
 
         set_admin_to = body.get("admin", False)
@@ -534,6 +547,7 @@ class UserRegisterServlet(RestServlet):
         self.reactor = hs.get_reactor()
         self.nonces: Dict[str, int] = {}
         self.hs = hs
+        self._all_user_types = hs.config.user_types.all_user_types
 
     def _clear_old_nonces(self) -> None:
         """
@@ -615,7 +629,7 @@ class UserRegisterServlet(RestServlet):
         user_type = body.get("user_type", None)
         displayname = body.get("displayname", None)
 
-        if user_type is not None and user_type not in UserTypes.ALL_USER_TYPES:
+        if user_type is not None and user_type not in self._all_user_types:
             raise SynapseError(HTTPStatus.BAD_REQUEST, "Invalid user type")
 
         if "mac" not in body:
@@ -643,6 +657,34 @@ class UserRegisterServlet(RestServlet):
         want_mac = want_mac_builder.hexdigest()
 
         if not hmac.compare_digest(want_mac.encode("ascii"), got_mac.encode("ascii")):
+            # If the sensitive debug logger is enabled, log the full details.
+            #
+            # For reference, the `user_registration_sensitive_debug_logger.debug(...)`
+            # call is enough to gate the logging of sensitive information unless
+            # explicitly enabled. We only have this if-statement to avoid logging the
+            # suggestion to enable the debug logger if you already have it enabled.
+            if user_registration_sensitive_debug_logger.isEnabledFor(logging.DEBUG):
+                user_registration_sensitive_debug_logger.debug(
+                    "UserRegisterServlet: Incorrect HMAC digest: actual=%s, expected=%s, registration_shared_secret=%s, body=%s",
+                    got_mac,
+                    want_mac,
+                    self.hs.config.registration.registration_shared_secret,
+                    body,
+                )
+            else:
+                # Otherwise, just log the non-sensitive essentials and advertise the
+                # debug logger for sensitive information.
+                logger.debug(
+                    (
+                        "UserRegisterServlet: HMAC incorrect (username=%s): actual=%s, expected=%s - "
+                        "If you need more information, explicitly enable the `synapse.rest.admin.users.registration_debug` "
+                        "logger at the `DEBUG` level to log things like the full request body and "
+                        "`registration_shared_secret` used to calculate the HMAC."
+                    ),
+                    username,
+                    got_mac,
+                    want_mac,
+                )
             raise SynapseError(HTTPStatus.FORBIDDEN, "HMAC incorrect")
 
         should_issue_refresh_token = body.get("refresh_token", False)
@@ -744,6 +786,36 @@ class DeactivateAccountRestServlet(RestServlet):
             id_server_unbind_result = "no-support"
 
         return HTTPStatus.OK, {"id_server_unbind_result": id_server_unbind_result}
+
+
+class SuspendAccountRestServlet(RestServlet):
+    PATTERNS = admin_patterns("/suspend/(?P<target_user_id>[^/]*)$")
+
+    def __init__(self, hs: "HomeServer"):
+        self.auth = hs.get_auth()
+        self.is_mine = hs.is_mine
+        self.store = hs.get_datastores().main
+
+    class PutBody(RequestBodyModel):
+        suspend: StrictBool
+
+    async def on_PUT(
+        self, request: SynapseRequest, target_user_id: str
+    ) -> Tuple[int, JsonDict]:
+        requester = await self.auth.get_user_by_req(request)
+        await assert_user_is_admin(self.auth, requester)
+
+        if not self.is_mine(UserID.from_string(target_user_id)):
+            raise SynapseError(HTTPStatus.BAD_REQUEST, "Can only suspend local users")
+
+        if not await self.store.get_user_by_id(target_user_id):
+            raise NotFoundError("User not found")
+
+        body = parse_and_validate_json_object_from_request(request, self.PutBody)
+        suspend = body.suspend
+        await self.store.set_user_suspended_status(target_user_id, suspend)
+
+        return HTTPStatus.OK, {f"user_{target_user_id}_suspended": suspend}
 
 
 class AccountValidityRenewServlet(RestServlet):
@@ -928,7 +1000,7 @@ class UserAdminServlet(RestServlet):
                 "Only local users can be admins of this homeserver",
             )
 
-        is_admin = await self.store.is_server_admin(target_user)
+        is_admin = await self.store.is_server_admin(target_user.to_string())
 
         return HTTPStatus.OK, {"admin": is_admin}
 
@@ -963,7 +1035,7 @@ class UserAdminServlet(RestServlet):
 
 class UserMembershipRestServlet(RestServlet):
     """
-    Get room list of an user.
+    Get list of joined room ID's for a user.
     """
 
     PATTERNS = admin_patterns("/users/(?P<user_id>[^/]*)/joined_rooms$")
@@ -979,8 +1051,9 @@ class UserMembershipRestServlet(RestServlet):
         await assert_requester_is_admin(self.auth, request)
 
         room_ids = await self.store.get_rooms_for_user(user_id)
-        ret = {"joined_rooms": list(room_ids), "total": len(room_ids)}
-        return HTTPStatus.OK, ret
+        rooms_response = {"joined_rooms": list(room_ids), "total": len(room_ids)}
+
+        return HTTPStatus.OK, rooms_response
 
 
 class PushersRestServlet(RestServlet):
@@ -1385,3 +1458,151 @@ class UserByThreePid(RestServlet):
             raise NotFoundError("User not found")
 
         return HTTPStatus.OK, {"user_id": user_id}
+
+
+class RedactUser(RestServlet):
+    """
+    Redact all the events of a given user in the given rooms or if empty dict is provided
+    then all events in all rooms user is member of. Kicks off a background process and
+    returns an id that can be used to check on the progress of the redaction progress.
+    """
+
+    PATTERNS = admin_patterns("/user/(?P<user_id>[^/]*)/redact")
+
+    def __init__(self, hs: "HomeServer"):
+        self._auth = hs.get_auth()
+        self._store = hs.get_datastores().main
+        self.admin_handler = hs.get_admin_handler()
+
+    class PostBody(RequestBodyModel):
+        rooms: List[StrictStr]
+        reason: Optional[StrictStr]
+        limit: Optional[StrictInt]
+        use_admin: Optional[StrictBool]
+
+    async def on_POST(
+        self, request: SynapseRequest, user_id: str
+    ) -> Tuple[int, JsonDict]:
+        requester = await self._auth.get_user_by_req(request)
+        await assert_user_is_admin(self._auth, requester)
+
+        # parse provided user id to check that it is valid
+        UserID.from_string(user_id)
+
+        body = parse_and_validate_json_object_from_request(request, self.PostBody)
+
+        limit = body.limit
+        if limit and limit <= 0:
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST,
+                "If limit is provided it must be a non-negative integer greater than 0.",
+            )
+
+        rooms = body.rooms
+        if not rooms:
+            current_rooms = list(await self._store.get_rooms_for_user(user_id))
+            banned_rooms = list(
+                await self._store.get_rooms_user_currently_banned_from(user_id)
+            )
+            rooms = current_rooms + banned_rooms
+
+        use_admin = body.use_admin
+        if not use_admin:
+            use_admin = False
+
+        redact_id = await self.admin_handler.start_redact_events(
+            user_id, rooms, requester.serialize(), use_admin, body.reason, limit
+        )
+
+        return HTTPStatus.OK, {"redact_id": redact_id}
+
+
+class RedactUserStatus(RestServlet):
+    """
+    Check on the progress of the redaction request represented by the provided ID, returning
+    the status of the process and a dict of events that were unable to be redacted, if any
+    """
+
+    PATTERNS = admin_patterns("/user/redact_status/(?P<redact_id>[^/]*)$")
+
+    def __init__(self, hs: "HomeServer"):
+        self._auth = hs.get_auth()
+        self.admin_handler = hs.get_admin_handler()
+
+    async def on_GET(
+        self, request: SynapseRequest, redact_id: str
+    ) -> Tuple[int, JsonDict]:
+        await assert_requester_is_admin(self._auth, request)
+
+        task = await self.admin_handler.get_redact_task(redact_id)
+
+        if task:
+            if task.status == TaskStatus.ACTIVE:
+                return HTTPStatus.OK, {"status": TaskStatus.ACTIVE}
+            elif task.status == TaskStatus.COMPLETE:
+                assert task.result is not None
+                failed_redactions = task.result.get("failed_redactions")
+                return HTTPStatus.OK, {
+                    "status": TaskStatus.COMPLETE,
+                    "failed_redactions": failed_redactions if failed_redactions else {},
+                }
+            elif task.status == TaskStatus.SCHEDULED:
+                return HTTPStatus.OK, {"status": TaskStatus.SCHEDULED}
+            else:
+                return HTTPStatus.OK, {
+                    "status": TaskStatus.FAILED,
+                    "error": (
+                        task.error
+                        if task.error
+                        else "Unknown error, please check the logs for more information."
+                    ),
+                }
+        else:
+            raise NotFoundError("redact id '%s' not found" % redact_id)
+
+
+class UserInvitesCount(RestServlet):
+    """
+    Return the count of invites that the user has sent after the given timestamp
+    """
+
+    PATTERNS = admin_patterns("/users/(?P<user_id>[^/]*)/sent_invite_count")
+
+    def __init__(self, hs: "HomeServer"):
+        self._auth = hs.get_auth()
+        self.store = hs.get_datastores().main
+
+    async def on_GET(
+        self, request: SynapseRequest, user_id: str
+    ) -> Tuple[int, JsonDict]:
+        await assert_requester_is_admin(self._auth, request)
+        from_ts = parse_integer(request, "from_ts", required=True)
+
+        sent_invite_count = await self.store.get_sent_invite_count_by_user(
+            user_id, from_ts
+        )
+
+        return HTTPStatus.OK, {"invite_count": sent_invite_count}
+
+
+class UserJoinedRoomCount(RestServlet):
+    """
+    Return the count of rooms that the user has joined at or after the given timestamp, even
+    if they have subsequently left/been banned from those rooms.
+    """
+
+    PATTERNS = admin_patterns("/users/(?P<user_id>[^/]*)/cumulative_joined_room_count")
+
+    def __init__(self, hs: "HomeServer"):
+        self._auth = hs.get_auth()
+        self.store = hs.get_datastores().main
+
+    async def on_GET(
+        self, request: SynapseRequest, user_id: str
+    ) -> Tuple[int, JsonDict]:
+        await assert_requester_is_admin(self._auth, request)
+        from_ts = parse_integer(request, "from_ts", required=True)
+
+        joined_rooms = await self.store.get_rooms_for_user_by_date(user_id, from_ts)
+
+        return HTTPStatus.OK, {"cumulative_joined_room_count": len(joined_rooms)}

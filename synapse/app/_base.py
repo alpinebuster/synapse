@@ -68,13 +68,14 @@ from synapse.config._base import format_config_error
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import ListenerConfig, ManholeConfig, TCPListenerConfig
 from synapse.crypto import context_factory
+from synapse.events.auto_accept_invites import InviteAutoAccepter
 from synapse.events.presence_router import load_legacy_presence_router
 from synapse.handlers.auth import load_legacy_password_auth_providers
 from synapse.http.site import SynapseSite
 from synapse.logging.context import PreserveLoggingContext
 from synapse.logging.opentracing import init_tracer
 from synapse.metrics import install_gc_manager, register_threadpool
-from synapse.metrics.background_process_metrics import wrap_as_background_process
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.metrics.jemalloc import setup_jemalloc_stats
 from synapse.module_api.callbacks.spamchecker_callbacks import load_legacy_spam_checkers
 from synapse.module_api.callbacks.third_party_event_rules_callbacks import (
@@ -285,6 +286,16 @@ def register_start(
 def listen_metrics(bind_addresses: StrCollection, port: int) -> None:
     """
     Start Prometheus metrics server.
+
+    This method runs the metrics server on a different port, in a different thread to
+    Synapse. This can make it more resilient to heavy load in Synapse causing metric
+    requests to be slow or timeout.
+
+    Even though `start_http_server_prometheus(...)` uses `threading.Thread` behind the
+    scenes (where all threads share the GIL and only one thread can execute Python
+    bytecode at a time), this still works because the metrics thread can preempt the
+    Twisted reactor thread between bytecode boundaries and the metrics thread gets
+    scheduled with roughly equal priority to the Twisted reactor thread.
     """
     from prometheus_client import start_http_server as start_http_server_prometheus
 
@@ -292,30 +303,7 @@ def listen_metrics(bind_addresses: StrCollection, port: int) -> None:
 
     for host in bind_addresses:
         logger.info("Starting metrics listener on %s:%d", host, port)
-        _set_prometheus_client_use_created_metrics(False)
         start_http_server_prometheus(port, addr=host, registry=RegistryProxy)
-
-
-def _set_prometheus_client_use_created_metrics(new_value: bool) -> None:
-    """
-    Sets whether prometheus_client should expose `_created`-suffixed metrics for
-    all gauges, histograms and summaries.
-    There is no programmatic way to disable this without poking at internals;
-    the proper way is to use an environment variable which prometheus_client
-    loads at import time.
-
-    The motivation for disabling these `_created` metrics is that they're
-    a waste of space as they're not useful but they take up space in Prometheus.
-    """
-
-    import prometheus_client.metrics
-
-    if hasattr(prometheus_client.metrics, "_use_created"):
-        prometheus_client.metrics._use_created = new_value
-    else:
-        logger.error(
-            "Can't disable `_created` metrics in prometheus_client (brittle hack broken?)"
-        )
 
 
 def listen_manhole(
@@ -444,8 +432,8 @@ def listen_http(
         # getHost() returns a UNIXAddress which contains an instance variable of 'name'
         # encoded as a byte string. Decode as utf-8 so pretty.
         logger.info(
-            "Synapse now listening on Unix Socket at: "
-            f"{ports[0].getHost().name.decode('utf-8')}"
+            "Synapse now listening on Unix Socket at: %s",
+            ports[0].getHost().name.decode("utf-8"),
         )
 
     return ports
@@ -524,6 +512,7 @@ async def start(hs: "HomeServer") -> None:
     Args:
         hs: homeserver instance
     """
+    server_name = hs.hostname
     reactor = hs.get_reactor()
 
     # We want to use a separate thread pool for the resolver so that large
@@ -536,22 +525,34 @@ async def start(hs: "HomeServer") -> None:
     )
 
     # Register the threadpools with our metrics.
-    register_threadpool("default", reactor.getThreadPool())
-    register_threadpool("gai_resolver", resolver_threadpool)
+    register_threadpool(
+        name="default", server_name=server_name, threadpool=reactor.getThreadPool()
+    )
+    register_threadpool(
+        name="gai_resolver", server_name=server_name, threadpool=resolver_threadpool
+    )
 
     # Set up the SIGHUP machinery.
     if hasattr(signal, "SIGHUP"):
 
-        @wrap_as_background_process("sighup")
-        async def handle_sighup(*args: Any, **kwargs: Any) -> None:
-            # Tell systemd our state, if we're using it. This will silently fail if
-            # we're not using systemd.
-            sdnotify(b"RELOADING=1")
+        def handle_sighup(*args: Any, **kwargs: Any) -> "defer.Deferred[None]":
+            async def _handle_sighup(*args: Any, **kwargs: Any) -> None:
+                # Tell systemd our state, if we're using it. This will silently fail if
+                # we're not using systemd.
+                sdnotify(b"RELOADING=1")
 
-            for i, args, kwargs in _sighup_callbacks:
-                i(*args, **kwargs)
+                for i, args, kwargs in _sighup_callbacks:
+                    i(*args, **kwargs)
 
-            sdnotify(b"READY=1")
+                sdnotify(b"READY=1")
+
+            return run_as_background_process(
+                "sighup",
+                server_name,
+                _handle_sighup,
+                *args,
+                **kwargs,
+            )
 
         # We defer running the sighup handlers until next reactor tick. This
         # is so that we're in a sane state, e.g. flushing the logs may fail
@@ -581,6 +582,11 @@ async def start(hs: "HomeServer") -> None:
     for module, config in hs.config.modules.loaded_modules:
         m = module(config, module_api)
         logger.info("Loaded module %s", m)
+
+    if hs.config.auto_accept_invites.enabled:
+        # Start the local auto_accept_invites module.
+        m = InviteAutoAccepter(hs.config.auto_accept_invites, module_api)
+        logger.info("Loaded local module %s", m)
 
     load_legacy_spam_checkers(hs)
     load_legacy_third_party_event_rules(hs)
@@ -675,17 +681,17 @@ def setup_sentry(hs: "HomeServer") -> None:
     )
 
     # We set some default tags that give some context to this instance
-    with sentry_sdk.configure_scope() as scope:
-        scope.set_tag("matrix_server_name", hs.config.server.server_name)
+    global_scope = sentry_sdk.Scope.get_global_scope()
+    global_scope.set_tag("matrix_server_name", hs.config.server.server_name)
 
-        app = (
-            hs.config.worker.worker_app
-            if hs.config.worker.worker_app
-            else "synapse.app.homeserver"
-        )
-        name = hs.get_instance_name()
-        scope.set_tag("worker_app", app)
-        scope.set_tag("worker_name", name)
+    app = (
+        hs.config.worker.worker_app
+        if hs.config.worker.worker_app
+        else "synapse.app.homeserver"
+    )
+    name = hs.get_instance_name()
+    global_scope.set_tag("worker_app", app)
+    global_scope.set_tag("worker_name", name)
 
 
 def setup_sdnotify(hs: "HomeServer") -> None:

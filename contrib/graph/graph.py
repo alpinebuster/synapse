@@ -20,8 +20,8 @@
 #
 
 import argparse
-import cgi
 import datetime
+import html
 import json
 import urllib.request
 from typing import List
@@ -45,6 +45,10 @@ def make_graph(pdus: List[dict], filename_prefix: str) -> None:
     colors = {"red", "green", "blue", "yellow", "purple"}
 
     for pdu in pdus:
+        # TODO: The "origin" field has since been removed from events generated
+        # by Synapse. We should consider removing it here as well but since this
+        # is part of `contrib/`, it is left for the community to revise and ensure things
+        # still work correctly.
         origins.add(pdu.get("origin"))
 
     color_map = {color: color for color in colors if color in origins}
@@ -85,7 +89,7 @@ def make_graph(pdus: List[dict], filename_prefix: str) -> None:
             "name": name,
             "type": pdu.get("pdu_type"),
             "state_key": pdu.get("state_key"),
-            "content": cgi.escape(json.dumps(pdu.get("content")), quote=True),
+            "content": html.escape(json.dumps(pdu.get("content")), quote=True),
             "time": t,
             "depth": pdu.get("depth"),
         }

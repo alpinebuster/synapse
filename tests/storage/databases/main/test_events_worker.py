@@ -20,12 +20,12 @@
 #
 import json
 from contextlib import contextmanager
-from typing import Generator, List, Tuple
+from typing import Generator, List, Set, Tuple
 from unittest import mock
 
 from twisted.enterprise.adbapi import ConnectionPool
 from twisted.internet.defer import CancelledError, Deferred, ensureDeferred
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.api.room_versions import EventFormatVersions, RoomVersions
 from synapse.events import make_event_from_dict
@@ -295,6 +295,53 @@ class EventCacheTestCase(unittest.HomeserverTestCase):
             self.assertEqual(ctx.get_resource_usage().evt_db_fetch_count, 1)
 
 
+class GetEventsTestCase(unittest.HomeserverTestCase):
+    """Test `get_events(...)`/`get_events_as_list(...)`"""
+
+    servlets = [
+        admin.register_servlets,
+        room.register_servlets,
+        login.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store: EventsWorkerStore = hs.get_datastores().main
+
+    def test_get_lots_of_messages(self) -> None:
+        """Sanity check that `get_events(...)`/`get_events_as_list(...)` works"""
+        num_events = 100
+
+        user_id = self.register_user("user", "pass")
+        user_tok = self.login(user_id, "pass")
+
+        room_id = self.helper.create_room_as(user_id, tok=user_tok)
+
+        event_ids: Set[str] = set()
+        for i in range(num_events):
+            event = self.get_success(
+                inject_event(
+                    self.hs,
+                    room_id=room_id,
+                    type="m.room.message",
+                    sender=user_id,
+                    content={
+                        "body": f"foo{i}",
+                        "msgtype": "m.text",
+                    },
+                )
+            )
+            event_ids.add(event.event_id)
+
+        # Sanity check that we actually created the events
+        self.assertEqual(len(event_ids), num_events)
+
+        # This is the function under test
+        fetched_event_map = self.get_success(self.store.get_events(event_ids))
+
+        # Sanity check that we got the events back
+        self.assertIncludes(fetched_event_map.keys(), event_ids, exact=True)
+
+
 class DatabaseOutageTestCase(unittest.HomeserverTestCase):
     """Test event fetching during a database outage."""
 
@@ -402,24 +449,29 @@ class DatabaseOutageTestCase(unittest.HomeserverTestCase):
 
     def test_recovery(self) -> None:
         """Test that event fetchers recover after a database outage."""
-        with self._outage():
-            # Kick off a bunch of event fetches but do not pump the reactor
-            event_deferreds = []
-            for event_id in self.event_ids:
-                event_deferreds.append(ensureDeferred(self.store.get_event(event_id)))
+        with self.assertLogs(
+            "synapse.metrics.background_process_metrics", level="ERROR"
+        ):
+            with self._outage():
+                # Kick off a bunch of event fetches but do not pump the reactor
+                event_deferreds = []
+                for event_id in self.event_ids:
+                    event_deferreds.append(
+                        ensureDeferred(self.store.get_event(event_id))
+                    )
 
-            # We should have maxed out on event fetcher threads
-            self.assertEqual(self.store._event_fetch_ongoing, EVENT_QUEUE_THREADS)
+                # We should have maxed out on event fetcher threads
+                self.assertEqual(self.store._event_fetch_ongoing, EVENT_QUEUE_THREADS)
 
-            # All the event fetchers will fail
-            self.pump()
-            self.assertEqual(self.store._event_fetch_ongoing, 0)
+                # All the event fetchers will fail
+                self.pump()
+                self.assertEqual(self.store._event_fetch_ongoing, 0)
 
-            for event_deferred in event_deferreds:
-                failure = self.get_failure(event_deferred, Exception)
-                self.assertEqual(
-                    str(failure.value), "Could not connect to the database."
-                )
+                for event_deferred in event_deferreds:
+                    failure = self.get_failure(event_deferred, Exception)
+                    self.assertEqual(
+                        str(failure.value), "Could not connect to the database."
+                    )
 
         # This next event fetch should succeed
         self.get_success(self.store.get_event(self.event_ids[0]))

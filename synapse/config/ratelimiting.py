@@ -218,3 +218,37 @@ class RatelimitConfig(Config):
             "rc_media_create",
             defaults={"per_second": 10, "burst_count": 50},
         )
+
+        self.remote_media_downloads = RatelimitSettings(
+            key="rc_remote_media_downloads",
+            per_second=self.parse_size(
+                config.get("remote_media_download_per_second", "87K")
+            ),
+            burst_count=self.parse_size(
+                config.get("remote_media_download_burst_count", "500M")
+            ),
+        )
+
+        self.rc_presence_per_user = RatelimitSettings.parse(
+            config,
+            "rc_presence.per_user",
+            defaults={"per_second": 0.1, "burst_count": 1},
+        )
+
+        self.rc_delayed_event_mgmt = RatelimitSettings.parse(
+            config,
+            "rc_delayed_event_mgmt",
+            defaults={"per_second": 1, "burst_count": 5},
+        )
+
+        self.rc_room_creation = RatelimitSettings.parse(
+            config,
+            "rc_room_creation",
+            defaults={"per_second": 0.016, "burst_count": 10},
+        )
+
+        self.rc_reports = RatelimitSettings.parse(
+            config,
+            "rc_reports",
+            defaults={"per_second": 1, "burst_count": 5},
+        )

@@ -28,6 +28,8 @@ from synapse.api.errors import (
     Codes,
     InvalidClientTokenError,
     MissingClientTokenError,
+    UnrecognizedRequestError,
+    UserLockedError,
 )
 from synapse.http.site import SynapseRequest
 from synapse.logging.opentracing import active_span, force_tracing, start_active_span
@@ -38,7 +40,9 @@ from . import GUEST_DEVICE_ID
 from .base import BaseAuth
 
 if TYPE_CHECKING:
+    from synapse.rest.admin.experimental_features import ExperimentalFeature
     from synapse.server import HomeServer
+
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +110,32 @@ class InternalAuth(BaseAuth):
                     parent_span.set_tag("appservice_id", requester.app_service.id)
             return requester
 
+    async def get_user_by_req_experimental_feature(
+        self,
+        request: SynapseRequest,
+        feature: "ExperimentalFeature",
+        allow_guest: bool = False,
+        allow_expired: bool = False,
+        allow_locked: bool = False,
+    ) -> Requester:
+        try:
+            requester = await self.get_user_by_req(
+                request,
+                allow_guest=allow_guest,
+                allow_expired=allow_expired,
+                allow_locked=allow_locked,
+            )
+            if await self.store.is_feature_enabled(requester.user.to_string(), feature):
+                return requester
+
+            raise UnrecognizedRequestError(code=404)
+        except (AuthError, InvalidClientTokenError):
+            if feature.is_globally_enabled(self.hs.config):
+                # If its globally enabled then return the auth error
+                raise
+
+            raise UnrecognizedRequestError(code=404)
+
     @cancellable
     async def _wrapped_get_user_by_req(
         self,
@@ -133,12 +163,7 @@ class InternalAuth(BaseAuth):
                 if not allow_locked and await self.store.get_user_locked_status(
                     requester.user.to_string()
                 ):
-                    raise AuthError(
-                        401,
-                        "User account has been locked",
-                        errcode=Codes.USER_LOCKED,
-                        additional_fields={"soft_logout": True},
-                    )
+                    raise UserLockedError()
 
                 # Deny the request if the user account has expired.
                 # This check is only done for regular users, not appservice ones.
@@ -271,4 +296,4 @@ class InternalAuth(BaseAuth):
         Returns:
             True if the user is an admin
         """
-        return await self.store.is_server_admin(requester.user)
+        return await self.store.is_server_admin(requester.user.to_string())

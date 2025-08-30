@@ -19,17 +19,11 @@
 #
 #
 import collections.abc
-from typing import TYPE_CHECKING, List, Type, Union, cast
+from typing import List, Type, Union, cast
 
 import jsonschema
 
-from synapse._pydantic_compat import HAS_PYDANTIC_V2
-
-if TYPE_CHECKING or HAS_PYDANTIC_V2:
-    from pydantic.v1 import Field, StrictBool, StrictStr
-else:
-    from pydantic import Field, StrictBool, StrictStr
-
+from synapse._pydantic_compat import Field, StrictBool, StrictStr
 from synapse.api.constants import (
     MAX_ALIAS_LENGTH,
     EventContentFields,
@@ -47,9 +41,9 @@ from synapse.events.utils import (
     validate_canonicaljson,
 )
 from synapse.http.servlet import validate_json_object
-from synapse.rest.models import RequestBodyModel
 from synapse.storage.controllers.state import server_acl_evaluator_from_event
 from synapse.types import EventID, JsonDict, RoomID, StrCollection, UserID
+from synapse.types.rest import RequestBodyModel
 
 
 class EventValidator:
@@ -73,7 +67,6 @@ class EventValidator:
             "auth_events",
             "content",
             "hashes",
-            "origin",
             "prev_events",
             "sender",
             "type",
@@ -83,18 +76,9 @@ class EventValidator:
             if k not in event:
                 raise SynapseError(400, "Event does not have key %s" % (k,))
 
-        # Check that the following keys have string values
-        event_strings = ["origin"]
-
-        for s in event_strings:
-            if not isinstance(getattr(event, s), str):
-                raise SynapseError(400, "'%s' not a string type" % (s,))
-
         # Depending on the room version, ensure the data is spec compliant JSON.
         if event.room_version.strict_canonicaljson:
-            # Note that only the client controlled portion of the event is
-            # checked, since we trust the portions of the event we created.
-            validate_canonicaljson(event.content)
+            validate_canonicaljson(event.get_pdu_json())
 
         if event.type == EventTypes.Aliases:
             if "aliases" in event.content:
@@ -199,7 +183,17 @@ class EventValidator:
         fields an event would have
         """
 
+        create_event_as_room_id = (
+            event.room_version.msc4291_room_ids_as_hashes
+            and event.type == EventTypes.Create
+            and hasattr(event, "state_key")
+            and event.state_key == ""
+        )
+
         strings = ["room_id", "sender", "type"]
+
+        if create_event_as_room_id:
+            strings.remove("room_id")
 
         if hasattr(event, "state_key"):
             strings.append("state_key")
@@ -208,7 +202,14 @@ class EventValidator:
             if not isinstance(getattr(event, s), str):
                 raise SynapseError(400, "Not '%s' a string type" % (s,))
 
-        RoomID.from_string(event.room_id)
+        if not create_event_as_room_id:
+            assert event.room_id is not None
+            RoomID.from_string(event.room_id)
+            if event.room_version.msc4291_room_ids_as_hashes and not RoomID.is_valid(
+                event.room_id
+            ):
+                raise SynapseError(400, f"Invalid room ID '{event.room_id}'")
+
         UserID.from_string(event.sender)
 
         if event.type == EventTypes.Message:

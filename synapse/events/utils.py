@@ -26,8 +26,8 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Collection,
     Dict,
-    Iterable,
     List,
     Mapping,
     Match,
@@ -40,6 +40,8 @@ import attr
 from canonicaljson import encode_canonical_json
 
 from synapse.api.constants import (
+    CANONICALJSON_MAX_INT,
+    CANONICALJSON_MIN_INT,
     MAX_PDU_SIZE,
     EventContentFields,
     EventTypes,
@@ -47,9 +49,10 @@ from synapse.api.constants import (
 )
 from synapse.api.errors import Codes, SynapseError
 from synapse.api.room_versions import RoomVersion
+from synapse.logging.opentracing import SynapseTags, set_tag, trace
 from synapse.types import JsonDict, Requester
 
-from . import EventBase
+from . import EventBase, StrippedStateEvent, make_event_from_dict
 
 if TYPE_CHECKING:
     from synapse.handlers.relations import BundledAggregations
@@ -60,9 +63,6 @@ if TYPE_CHECKING:
 SPLIT_FIELD_REGEX = re.compile(r"\\*\.")
 # Find escaped characters, e.g. those with a \ in front of them.
 ESCAPE_SEQUENCE_PATTERN = re.compile(r"\\(.)")
-
-CANONICALJSON_MAX_INT = (2**53) - 1
-CANONICALJSON_MIN_INT = -CANONICALJSON_MAX_INT
 
 
 # Module API callback that allows adding fields to the unsigned section of
@@ -82,23 +82,45 @@ def prune_event(event: EventBase) -> EventBase:
     """
     pruned_event_dict = prune_event_dict(event.room_version, event.get_dict())
 
-    from . import make_event_from_dict
-
     pruned_event = make_event_from_dict(
         pruned_event_dict, event.room_version, event.internal_metadata.get_dict()
     )
 
-    # copy the internal fields
+    # Copy the bits of `internal_metadata` that aren't returned by `get_dict`
     pruned_event.internal_metadata.stream_ordering = (
         event.internal_metadata.stream_ordering
     )
-
+    pruned_event.internal_metadata.instance_name = event.internal_metadata.instance_name
     pruned_event.internal_metadata.outlier = event.internal_metadata.outlier
 
     # Mark the event as redacted
     pruned_event.internal_metadata.redacted = True
 
     return pruned_event
+
+
+def clone_event(event: EventBase) -> EventBase:
+    """Take a copy of the event.
+
+    This is mostly useful because it does a *shallow* copy of the `unsigned` data,
+    which means it can then be updated without corrupting the in-memory cache. Note that
+    other properties of the event, such as `content`, are *not* (currently) copied here.
+    """
+    # XXX: We rely on at least one of `event.get_dict()` and `make_event_from_dict()`
+    #   making a copy of `unsigned`. Currently, both do, though I don't really know why.
+    #   Still, as long as they do, there's not much point doing yet another copy here.
+    new_event = make_event_from_dict(
+        event.get_dict(), event.room_version, event.internal_metadata.get_dict()
+    )
+
+    # Copy the bits of `internal_metadata` that aren't returned by `get_dict`.
+    new_event.internal_metadata.stream_ordering = (
+        event.internal_metadata.stream_ordering
+    )
+    new_event.internal_metadata.instance_name = event.internal_metadata.instance_name
+    new_event.internal_metadata.outlier = event.internal_metadata.outlier
+
+    return new_event
 
 
 def prune_event_dict(room_version: RoomVersion, event_dict: JsonDict) -> JsonDict:
@@ -155,9 +177,12 @@ def prune_event_dict(room_version: RoomVersion, event_dict: JsonDict) -> JsonDic
         if room_version.updated_redaction_rules:
             # MSC2176 rules state that create events cannot have their `content` redacted.
             new_content = event_dict["content"]
-        elif not room_version.implicit_room_creator:
+        if not room_version.implicit_room_creator:
             # Some room versions give meaning to `creator`
             add_fields("creator")
+        if room_version.msc4291_room_ids_as_hashes:
+            # room_id is not allowed on the create event as it's derived from the event ID
+            allowed_keys.remove("room_id")
 
     elif event_type == EventTypes.JoinRules:
         add_fields("join_rule")
@@ -400,9 +425,19 @@ class SerializeEventConfig:
     # False, that state will be removed from the event before it is returned.
     # Otherwise, it will be kept.
     include_stripped_room_state: bool = False
+    # When True, sets unsigned fields to help clients identify events which
+    # only server admins can see through other configuration. For example,
+    # whether an event was soft failed by the server.
+    include_admin_metadata: bool = False
 
 
 _DEFAULT_SERIALIZE_EVENT_CONFIG = SerializeEventConfig()
+
+
+def make_config_for_admin(existing: SerializeEventConfig) -> SerializeEventConfig:
+    # Set the options which are only available to server admins,
+    # and copy the rest.
+    return attr.evolve(existing, include_admin_metadata=True)
 
 
 def serialize_event(
@@ -496,6 +531,10 @@ def serialize_event(
     if config.as_client_event:
         d = config.event_format(d)
 
+    # Ensure the room_id field is set for create events in MSC4291 rooms
+    if e.type == EventTypes.Create and e.room_version.msc4291_room_ids_as_hashes:
+        d["room_id"] = e.room_id
+
     # If the event is a redaction, the field with the redacted event ID appears
     # in a different location depending on the room version. e.redacts handles
     # fetching from the proper location; copy it to the other location for forwards-
@@ -506,6 +545,12 @@ def serialize_event(
         else:
             d["content"] = dict(d["content"])
             d["content"]["redacts"] = e.redacts
+
+    if config.include_admin_metadata:
+        if e.internal_metadata.is_soft_failed():
+            d["unsigned"]["io.element.synapse.soft_failed"] = True
+        if e.internal_metadata.policy_server_spammy:
+            d["unsigned"]["io.element.synapse.policy_server_spammy"] = True
 
     only_event_fields = config.only_event_fields
     if only_event_fields:
@@ -527,6 +572,7 @@ class EventClientSerializer:
 
     def __init__(self, hs: "HomeServer") -> None:
         self._store = hs.get_datastores().main
+        self._auth = hs.get_auth()
         self._add_extra_fields_to_unsigned_client_event_callbacks: List[
             ADD_EXTRA_FIELDS_TO_UNSIGNED_CLIENT_EVENT_CALLBACK
         ] = []
@@ -554,6 +600,15 @@ class EventClientSerializer:
         # To handle the case of presence events and the like
         if not isinstance(event, EventBase):
             return event
+
+        # Force-enable server admin metadata because the only time an event with
+        # relevant metadata will be when the admin requested it via their admin
+        # client config account data. Also, it's "just" some `unsigned` fields, so
+        # shouldn't cause much in terms of problems to downstream consumers.
+        if config.requester is not None and await self._auth.is_server_admin(
+            config.requester
+        ):
+            config = make_config_for_admin(config)
 
         serialized_event = serialize_event(event, time_now, config=config)
 
@@ -656,9 +711,10 @@ class EventClientSerializer:
                 "m.relations", {}
             ).update(serialized_aggregations)
 
+    @trace
     async def serialize_events(
         self,
-        events: Iterable[Union[JsonDict, EventBase]],
+        events: Collection[Union[JsonDict, EventBase]],
         time_now: int,
         *,
         config: SerializeEventConfig = _DEFAULT_SERIALIZE_EVENT_CONFIG,
@@ -677,6 +733,11 @@ class EventClientSerializer:
         Returns:
             The list of serialized events
         """
+        set_tag(
+            SynapseTags.FUNC_ARG_PREFIX + "events.length",
+            str(len(events)),
+        )
+
         return [
             await self.serialize_event(
                 event,
@@ -814,3 +875,56 @@ def maybe_upsert_event_field(
             del container[key]
 
     return upsert_okay
+
+
+def strip_event(event: EventBase) -> JsonDict:
+    """
+    Used for "stripped state" events which provide a simplified view of the state of a
+    room intended to help a potential joiner identify the room (relevant when the user
+    is invited or knocked).
+
+    Stripped state events can only have the `sender`, `type`, `state_key` and `content`
+    properties present.
+    """
+    # MSC4311: Ensure the create event is available on invites and knocks.
+    # TODO: Implement the rest of MSC4311
+    if (
+        event.room_version.msc4291_room_ids_as_hashes
+        and event.type == EventTypes.Create
+        and event.get_state_key() == ""
+    ):
+        return event.get_pdu_json()
+
+    return {
+        "type": event.type,
+        "state_key": event.state_key,
+        "content": event.content,
+        "sender": event.sender,
+    }
+
+
+def parse_stripped_state_event(raw_stripped_event: Any) -> Optional[StrippedStateEvent]:
+    """
+    Given a raw value from an event's `unsigned` field, attempt to parse it into a
+    `StrippedStateEvent`.
+    """
+    if isinstance(raw_stripped_event, dict):
+        # All of these fields are required
+        type = raw_stripped_event.get("type")
+        state_key = raw_stripped_event.get("state_key")
+        sender = raw_stripped_event.get("sender")
+        content = raw_stripped_event.get("content")
+        if (
+            isinstance(type, str)
+            and isinstance(state_key, str)
+            and isinstance(sender, str)
+            and isinstance(content, dict)
+        ):
+            return StrippedStateEvent(
+                type=type,
+                state_key=state_key,
+                sender=sender,
+                content=content,
+            )
+
+    return None

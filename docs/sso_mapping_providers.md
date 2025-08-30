@@ -10,7 +10,7 @@ As an example, a SSO service may return the email address
 to turn that into a displayname when creating a Matrix user for this individual.
 It may choose `John Smith`, or `Smith, John [Example.com]` or any number of
 variations. As each Synapse configuration may want something different, this is
-where SAML mapping providers come into play.
+where SSO mapping providers come into play.
 
 SSO mapping providers are currently supported for OpenID and SAML SSO
 configurations. Please see the details below for how to implement your own.
@@ -98,6 +98,7 @@ A custom mapping provider must specify the following methods:
         either accept this localpart or pick their own username. Otherwise this
         option has no effect. If omitted, defaults to `False`.
       - `display_name`: An optional string, the display name for the user.
+      - `picture`: An optional string, the avatar url for the user.
       - `emails`: A list of strings, the email address(es) to associate with
         this user. If omitted, defaults to an empty list.
 * `async def get_extra_attributes(self, userinfo, token)`

@@ -52,8 +52,6 @@ architecture via <https://packages.matrix.org/debian/>.
 
 To install the latest release:
 
-TODO UPDATE ALL THIS
-
 ```sh
 sudo apt install -y lsb-release wget apt-transport-https
 sudo wget -O /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
@@ -159,7 +157,7 @@ sudo pip install py-bcrypt
 
 #### Alpine Linux
 
-6543 maintains [Synapse packages for Alpine Linux](https://pkgs.alpinelinux.org/packages?name=synapse&branch=edge) in the community repository. Install with:
+Jahway603 maintains [Synapse packages for Alpine Linux](https://pkgs.alpinelinux.org/packages?name=synapse&branch=edge) in the community repository. Install with:
 
 ```sh
 sudo apk add synapse
@@ -210,7 +208,7 @@ When following this route please make sure that the [Platform-specific prerequis
 System requirements:
 
 - POSIX-compliant system (tested on Linux & OS X)
-- Python 3.8 or later, up to Python 3.11.
+- Python 3.9 or later, up to Python 3.13.
 - At least 1GB of free RAM if you want to join large public rooms like #matrix:matrix.org
 
 If building on an uncommon architecture for which pre-built wheels are
@@ -259,9 +257,9 @@ users, etc.) to the developers via the `--report-stats` argument.
 
 This command will generate you a config file that you can then customise, but it will
 also generate a set of keys for you. These keys will allow your homeserver to
-identify itself to other homeserver, so don't lose or delete them. It would be
+identify itself to other homeservers, so don't lose or delete them. It would be
 wise to back them up somewhere safe. (If, for whatever reason, you do need to
-change your homeserver's keys, you may find that other homeserver have the
+change your homeserver's keys, you may find that other homeservers have the
 old key cached. If you update the signing key, you should change the name of the
 key in the `<server name>.signing.key` file (the second word) to something
 different. See the [spec](https://matrix.org/docs/spec/server_server/latest.html#retrieving-server-keys) for more information on key management).
@@ -288,7 +286,7 @@ Installing prerequisites on Ubuntu or Debian:
 ```sh
 sudo apt install build-essential python3-dev libffi-dev \
                      python3-pip python3-setuptools sqlite3 \
-                     libssl-dev virtualenv libjpeg-dev libxslt1-dev libicu-dev
+                     libssl-dev virtualenv libjpeg-dev libxslt1-dev
 ```
 
 ##### ArchLinux
@@ -297,7 +295,7 @@ Installing prerequisites on ArchLinux:
 
 ```sh
 sudo pacman -S base-devel python python-pip \
-               python-setuptools python-virtualenv sqlite3 icu
+               python-setuptools python-virtualenv sqlite3
 ```
 
 ##### CentOS/Fedora
@@ -307,9 +305,52 @@ Installing prerequisites on CentOS or Fedora Linux:
 ```sh
 sudo dnf install libtiff-devel libjpeg-devel libzip-devel freetype-devel \
                  libwebp-devel libxml2-devel libxslt-devel libpq-devel \
-                 python3-virtualenv libffi-devel openssl-devel python3-devel \
-                 libicu-devel
-sudo dnf groupinstall "Development Tools"
+                 python3-virtualenv libffi-devel openssl-devel python3-devel
+sudo dnf group install "Development Tools"
+```
+
+##### Red Hat Enterprise Linux / Rocky Linux / Oracle Linux
+
+*Note: The term "RHEL" below refers to Red Hat Enterprise Linux, Oracle Linux and Rocky Linux. The distributions are 1:1 binary compatible.*
+
+It's recommended to use the latest Python versions.
+
+RHEL 8 in particular ships with Python 3.6 by default which is EOL and therefore no longer supported by Synapse. RHEL 9 ships with Python 3.9 which is still supported by the Python core team as of this writing. However, newer Python versions provide significant performance improvements and they're available in official distributions' repositories. Therefore it's recommended to use them.
+
+Python 3.11 and 3.12 are available for both RHEL 8 and 9.
+
+These commands should be run as root user.
+
+Install new version of Python. You only need one of these:
+```bash
+# Python 3.11
+dnf install python3.11 python3.11-devel
+```
+```bash
+# Python 3.12
+dnf install python3.12 python3.12-devel
+```
+Finally, install common prerequisites
+```bash
+dnf install libpq5 libpq5-devel lz4 pkgconf
+dnf group install "Development Tools"
+```
+###### Using venv module instead of virtualenv command
+
+It's recommended to use Python venv module directly rather than the virtualenv command.
+* On RHEL 9, virtualenv is only available on [EPEL](https://docs.fedoraproject.org/en-US/epel/).
+* On RHEL 8, virtualenv is based on Python 3.6. It does not support creating 3.11/3.12 virtual environments.
+
+Here's an example of creating Python 3.12 virtual environment and installing Synapse from PyPI.
+
+```bash
+mkdir -p ~/synapse
+# To use Python 3.11, simply use the command "python3.11" instead.
+python3.12 -m venv ~/synapse/env
+source ~/synapse/env/bin/activate
+pip install --upgrade pip
+pip install --upgrade setuptools
+pip install matrix-synapse
 ```
 
 ##### macOS
@@ -322,20 +363,6 @@ xcode-select --install
 ```
 
 Some extra dependencies may be needed. You can use Homebrew (https://brew.sh) for them.
-
-You may need to install icu, and make the icu binaries and libraries accessible.
-Please follow [the official instructions of PyICU](https://pypi.org/project/PyICU/) to do so.
-
-If you're struggling to get icu discovered, and see:
-```
-  RuntimeError:
-  Please install pkg-config on your system or set the ICU_VERSION environment
-  variable to the version of ICU you have installed.
-```
-despite it being installed and having your `PATH` updated, you can omit this dependency by
-not specifying `--extras all` to `poetry`. If using postgres, you can install Synapse via
-`poetry install --extras saml2 --extras oidc --extras postgres --extras opentracing --extras redis --extras sentry`.
-ICU is not a hard dependency on getting a working installation.
 
 On ARM-based Macs you may also need to install libjpeg and libpq:
 ```sh
@@ -358,8 +385,7 @@ Installing prerequisites on openSUSE:
 ```sh
 sudo zypper in -t pattern devel_basis
 sudo zypper in python-pip python-setuptools sqlite3 python-virtualenv \
-               python-devel libffi-devel libopenssl-devel libjpeg62-devel \
-               libicu-devel
+               python-devel libffi-devel libopenssl-devel libjpeg62-devel
 ```
 
 ##### OpenBSD
@@ -602,6 +628,10 @@ your loopback and RFC1918 IP addresses are blacklisted.
 This also requires the optional `lxml` python dependency to be  installed. This
 in turn requires the `libxml2` library to be available - on  Debian/Ubuntu this
 means `apt-get install libxml2-dev`, or equivalent for your OS.
+
+### Backups
+
+Don't forget to take [backups](../usage/administration/backups.md) of your new server!
 
 ### Troubleshooting Installation
 

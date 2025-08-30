@@ -2,7 +2,7 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 # Copyright 2014-2021 The Matrix.org Foundation C.I.C.
-# Copyright (C) 2023 New Vector, Ltd
+# Copyright (C) 2023-2024 New Vector, Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -25,11 +25,13 @@ import logging
 import os.path
 import urllib.parse
 from textwrap import indent
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from urllib.request import getproxies_environment
 
 import attr
 import yaml
 from netaddr import AddrFormatError, IPNetwork, IPSet
+from typing_extensions import TypeGuard
 
 from twisted.conch.ssh.keys import Key
 
@@ -41,7 +43,22 @@ from synapse.util.stringutils import parse_and_validate_server_name
 from ._base import Config, ConfigError
 from ._util import validate_config
 
-logger = logging.Logger(__name__)
+logger = logging.getLogger(__name__)
+
+
+# Directly from the mypy docs:
+# https://typing.python.org/en/latest/spec/narrowing.html#typeguard
+def is_str_list(val: Any, allow_empty: bool) -> TypeGuard[list[str]]:
+    """
+    Type-narrow a value to a list of strings (compatible with mypy).
+    """
+    if not isinstance(val, list):
+        return False
+
+    if len(val) == 0:
+        return allow_empty
+    return all(isinstance(x, str) for x in val)
+
 
 DIRECT_TCP_ERROR = """
 Using direct TCP replication for workers is no longer supported.
@@ -215,9 +232,6 @@ class HttpListenerConfig:
     additional_resources: Dict[str, dict] = attr.Factory(dict)
     tag: Optional[str] = None
     request_id_header: Optional[str] = None
-    # If true, the listener will return CORS response headers compatible with MSC3886:
-    # https://github.com/matrix-org/matrix-spec-proposals/pull/3886
-    experimental_cors_msc3886: bool = False
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -294,6 +308,102 @@ class LimitRemoteRoomsConfig:
     )
 
 
+class ProxyConfigDictionary(TypedDict):
+    """
+    Dictionary of proxy settings suitable for interacting with `urllib.request` API's
+    """
+
+    http: Optional[str]
+    """
+    Proxy server to use for HTTP requests.
+    """
+    https: Optional[str]
+    """
+    Proxy server to use for HTTPS requests.
+    """
+    no: str
+    """
+    Comma-separated list of hosts, IP addresses, or IP ranges in CIDR format which
+    should not use the proxy.
+
+    Empty string means no hosts should be excluded from the proxy.
+    """
+
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class ProxyConfig:
+    """
+    Synapse configuration for HTTP proxy settings.
+    """
+
+    http_proxy: Optional[str]
+    """
+    Proxy server to use for HTTP requests.
+    """
+    https_proxy: Optional[str]
+    """
+    Proxy server to use for HTTPS requests.
+    """
+    no_proxy_hosts: Optional[List[str]]
+    """
+    List of hosts, IP addresses, or IP ranges in CIDR format which should not use the
+    proxy. Synapse will directly connect to these hosts.
+    """
+
+    def get_proxies_dictionary(self) -> ProxyConfigDictionary:
+        """
+        Returns a dictionary of proxy settings suitable for interacting with
+        `urllib.request` API's (e.g. `urllib.request.proxy_bypass_environment`)
+
+        The keys are `"http"`, `"https"`, and `"no"`.
+        """
+        return ProxyConfigDictionary(
+            http=self.http_proxy,
+            https=self.https_proxy,
+            no=",".join(self.no_proxy_hosts) if self.no_proxy_hosts else "",
+        )
+
+
+def parse_proxy_config(config: JsonDict) -> ProxyConfig:
+    """
+    Figure out forward proxy config for outgoing HTTP requests.
+
+    Prefer values from the given config over the environment variables (`http_proxy`,
+    `https_proxy`, `no_proxy`, not case-sensitive).
+
+    Args:
+        config: The top-level homeserver configuration dictionary.
+    """
+    proxies_from_env = getproxies_environment()
+    http_proxy = config.get("http_proxy", proxies_from_env.get("http"))
+    if http_proxy is not None and not isinstance(http_proxy, str):
+        raise ConfigError("'http_proxy' must be a string", ("http_proxy",))
+
+    https_proxy = config.get("https_proxy", proxies_from_env.get("https"))
+    if https_proxy is not None and not isinstance(https_proxy, str):
+        raise ConfigError("'https_proxy' must be a string", ("https_proxy",))
+
+    # List of hosts which should not use the proxy. Synapse will directly connect to
+    # these hosts.
+    no_proxy_hosts = config.get("no_proxy_hosts")
+    # The `no_proxy` environment variable should be a comma-separated list of hosts,
+    # IP addresses, or IP ranges in CIDR format
+    no_proxy_from_env = proxies_from_env.get("no")
+    if no_proxy_hosts is None and no_proxy_from_env is not None:
+        no_proxy_hosts = no_proxy_from_env.split(",")
+
+    if no_proxy_hosts is not None and not is_str_list(no_proxy_hosts, allow_empty=True):
+        raise ConfigError(
+            "'no_proxy_hosts' must be a list of strings", ("no_proxy_hosts",)
+        )
+
+    return ProxyConfig(
+        http_proxy=http_proxy,
+        https_proxy=https_proxy,
+        no_proxy_hosts=no_proxy_hosts,
+    )
+
+
 class ServerConfig(Config):
     section = "server"
 
@@ -335,8 +445,14 @@ class ServerConfig(Config):
             logger.info("Using default public_baseurl %s", public_baseurl)
         else:
             self.serve_client_wellknown = True
+            # Ensure that public_baseurl ends with a trailing slash
             if public_baseurl[-1] != "/":
                 public_baseurl += "/"
+
+        # Scrutinize user-provided config
+        if not isinstance(public_baseurl, str):
+            raise ConfigError("Must be a string", ("public_baseurl",))
+
         self.public_baseurl = public_baseurl
 
         # check that public_baseurl is valid
@@ -384,6 +500,11 @@ class ServerConfig(Config):
         # Whether to internally track presence, requires that presence is enabled,
         self.track_presence = self.presence_enabled and presence_enabled != "untracked"
 
+        # Determines if presence results for offline users are included on initial/full sync
+        self.presence_include_offline_users_on_sync = presence_config.get(
+            "include_offline_users_on_sync", False
+        )
+
         # Custom presence router module
         # This is the legacy way of configuring it (the config should now be put in the modules section)
         self.presence_router_module_class = None
@@ -394,12 +515,6 @@ class ServerConfig(Config):
                 self.presence_router_module_class,
                 self.presence_router_config,
             ) = load_module(presence_router_config, ("presence", "presence_router"))
-
-        # whether to enable the media repository endpoints. This should be set
-        # to false if the media repository is running as a separate endpoint;
-        # doing so ensures that we will not run cache cleanup jobs on the
-        # master, potentially causing inconsistency.
-        self.enable_media_repo = config.get("enable_media_repo", True)
 
         # Whether to require authentication to retrieve profile data (avatars,
         # display names) of other users through the client API.
@@ -716,6 +831,17 @@ class ServerConfig(Config):
                 )
             )
 
+        # Figure out forward proxy config for outgoing HTTP requests.
+        #
+        # Prefer values from the file config over the environment variables
+        self.proxy_config = parse_proxy_config(config)
+        logger.debug(
+            "Using proxy settings: http_proxy=%s, https_proxy=%s, no_proxy=%s",
+            self.proxy_config.http_proxy,
+            self.proxy_config.https_proxy,
+            self.proxy_config.no_proxy_hosts,
+        )
+
         self.cleanup_extremities_with_dummy_events = config.get(
             "cleanup_extremities_with_dummy_events", True
         )
@@ -781,6 +907,17 @@ class ServerConfig(Config):
         else:
             self.delete_stale_devices_after = None
 
+        # The maximum allowed delay duration for delayed events (MSC4140).
+        max_event_delay_duration = config.get("max_event_delay_duration")
+        if max_event_delay_duration is not None:
+            self.max_event_delay_ms: Optional[int] = self.parse_duration(
+                max_event_delay_duration
+            )
+            if self.max_event_delay_ms <= 0:
+                raise ConfigError("max_event_delay_duration must be a positive value")
+        else:
+            self.max_event_delay_ms = None
+
     def has_tls_listener(self) -> bool:
         return any(listener.is_tls() for listener in self.listeners)
 
@@ -829,13 +966,10 @@ class ServerConfig(Config):
             ).lstrip()
 
         if not unsecure_listeners:
-            unsecure_http_bindings = (
-                """- port: %(unsecure_port)s
+            unsecure_http_bindings = """- port: %(unsecure_port)s
             tls: false
             type: http
-            x_forwarded: true"""
-                % locals()
-            )
+            x_forwarded: true""" % locals()
 
             if not open_private_ports:
                 unsecure_http_bindings += (
@@ -854,16 +988,13 @@ class ServerConfig(Config):
         if not secure_listeners:
             secure_http_bindings = ""
 
-        return (
-            """\
+        return """\
         server_name: "%(server_name)s"
         pid_file: %(pid_file)s
         listeners:
           %(secure_http_bindings)s
           %(unsecure_http_bindings)s
-        """
-            % locals()
-        )
+        """ % locals()
 
     def read_arguments(self, args: argparse.Namespace) -> None:
         if args.manhole is not None:
@@ -1000,7 +1131,6 @@ def parse_listener_def(num: int, listener: Any) -> ListenerConfig:
             additional_resources=listener.get("additional_resources", {}),
             tag=listener.get("tag"),
             request_id_header=listener.get("request_id_header"),
-            experimental_cors_msc3886=listener.get("experimental_cors_msc3886", False),
         )
 
     if socket_path:

@@ -1,14 +1,17 @@
 from unittest.mock import AsyncMock, patch
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 import synapse.rest.admin
 import synapse.rest.client.login
 import synapse.rest.client.room
-from synapse.api.constants import EventTypes, Membership
-from synapse.api.errors import LimitExceededError, SynapseError
+from synapse.api.constants import AccountDataTypes, EventTypes, Membership
+from synapse.api.errors import Codes, LimitExceededError, SynapseError
 from synapse.crypto.event_signing import add_hashes_and_signatures
 from synapse.events import FrozenEventV3
+from synapse.federation.federation_base import (
+    event_from_pdu_json,
+)
 from synapse.federation.federation_client import SendJoinResult
 from synapse.server import HomeServer
 from synapse.types import UserID, create_requester
@@ -70,6 +73,7 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
                 action=Membership.JOIN,
             ),
             LimitExceededError,
+            by=0.5,
         )
 
     @override_config({"rc_joins_per_room": {"per_second": 0, "burst_count": 2}})
@@ -171,20 +175,25 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
             )
         )
 
-        with patch.object(
-            self.handler.federation_handler.federation_client,
-            "make_membership_event",
-            mock_make_membership_event,
-        ), patch.object(
-            self.handler.federation_handler.federation_client,
-            "send_join",
-            mock_send_join,
-        ), patch(
-            "synapse.event_auth._is_membership_change_allowed",
-            return_value=None,
-        ), patch(
-            "synapse.handlers.federation_event.check_state_dependent_auth_rules",
-            return_value=None,
+        with (
+            patch.object(
+                self.handler.federation_handler.federation_client,
+                "make_membership_event",
+                mock_make_membership_event,
+            ),
+            patch.object(
+                self.handler.federation_handler.federation_client,
+                "send_join",
+                mock_send_join,
+            ),
+            patch(
+                "synapse.event_auth._is_membership_change_allowed",
+                return_value=None,
+            ),
+            patch(
+                "synapse.handlers.federation_event.check_state_dependent_auth_rules",
+                return_value=None,
+            ),
         ):
             self.get_success(
                 self.handler.update_membership(
@@ -206,6 +215,7 @@ class TestJoinsLimitedByPerRoomRateLimiter(FederatingHomeserverTestCase):
                     remote_room_hosts=[self.OTHER_SERVER_NAME],
                 ),
                 LimitExceededError,
+                by=0.5,
             )
 
     # TODO: test that remote joins to a room are rate limited.
@@ -273,6 +283,7 @@ class TestReplicatedJoinsLimitedByPerRoomRateLimiter(BaseMultiWorkerStreamTestCa
                 action=Membership.JOIN,
             ),
             LimitExceededError,
+            by=0.5,
         )
 
         # Try to join as Chris on the original worker. Should get denied because Alice
@@ -285,6 +296,7 @@ class TestReplicatedJoinsLimitedByPerRoomRateLimiter(BaseMultiWorkerStreamTestCa
                 action=Membership.JOIN,
             ),
             LimitExceededError,
+            by=0.5,
         )
 
 
@@ -376,8 +388,28 @@ class RoomMemberMasterHandlerTestCase(HomeserverTestCase):
         )
 
     def test_forget_when_not_left(self) -> None:
-        """Tests that a user cannot not forgets a room that has not left."""
+        """Tests that a user cannot forget a room that they are still in."""
         self.get_failure(self.handler.forget(self.alice_ID, self.room_id), SynapseError)
+
+    def test_nonlocal_room_user_action(self) -> None:
+        """
+        Test that non-local user ids cannot perform room actions through
+        this homeserver.
+        """
+        alien_user_id = UserID.from_string("@cheeky_monkey:matrix.org")
+        bad_room_id = f"{self.room_id}+BAD_ID"
+
+        exc = self.get_failure(
+            self.handler.update_membership(
+                create_requester(self.alice),
+                alien_user_id,
+                bad_room_id,
+                "unban",
+            ),
+            SynapseError,
+        ).value
+
+        self.assertEqual(exc.errcode, Codes.BAD_JSON)
 
     def test_rejoin_forgotten_by_user(self) -> None:
         """Test that a user that has forgotten a room can do a re-join.
@@ -403,3 +435,186 @@ class RoomMemberMasterHandlerTestCase(HomeserverTestCase):
         self.assertFalse(
             self.get_success(self.store.did_forget(self.alice, self.room_id))
         )
+
+    def test_deduplicate_joins(self) -> None:
+        """
+        Test that calling /join multiple times does not store a new state group.
+        """
+
+        self.helper.join(self.room_id, user=self.bob, tok=self.bob_token)
+
+        sql = "SELECT COUNT(*) FROM state_groups WHERE room_id = ?"
+        rows = self.get_success(
+            self.store.db_pool.execute("test_deduplicate_joins", sql, self.room_id)
+        )
+        initial_count = rows[0][0]
+
+        self.helper.join(self.room_id, user=self.bob, tok=self.bob_token)
+        rows = self.get_success(
+            self.store.db_pool.execute("test_deduplicate_joins", sql, self.room_id)
+        )
+        new_count = rows[0][0]
+
+        self.assertEqual(initial_count, new_count)
+
+
+class TestInviteFiltering(FederatingHomeserverTestCase):
+    servlets = [
+        synapse.rest.admin.register_servlets,
+        synapse.rest.client.login.register_servlets,
+        synapse.rest.client.room.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.handler = hs.get_room_member_handler()
+        self.fed_handler = hs.get_federation_handler()
+        self.store = hs.get_datastores().main
+
+        # Create three users.
+        self.alice = self.register_user("alice", "pass")
+        self.alice_token = self.login("alice", "pass")
+        self.bob = self.register_user("bob", "pass")
+        self.bob_token = self.login("bob", "pass")
+
+    @override_config({"experimental_features": {"msc4155_enabled": True}})
+    def test_misc4155_block_invite_local(self) -> None:
+        """Test that MSC4155 will block a user from being invited to a room"""
+        room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+
+        self.get_success(
+            self.store.add_account_data_for_user(
+                self.bob,
+                AccountDataTypes.MSC4155_INVITE_PERMISSION_CONFIG,
+                {
+                    "blocked_users": [self.alice],
+                },
+            )
+        )
+
+        f = self.get_failure(
+            self.handler.update_membership(
+                requester=create_requester(self.alice),
+                target=UserID.from_string(self.bob),
+                room_id=room_id,
+                action=Membership.INVITE,
+            ),
+            SynapseError,
+        ).value
+        self.assertEqual(f.code, 403)
+        self.assertEqual(f.errcode, "ORG.MATRIX.MSC4155.M_INVITE_BLOCKED")
+
+    @override_config({"experimental_features": {"msc4155_enabled": False}})
+    def test_msc4155_disabled_allow_invite_local(self) -> None:
+        """Test that MSC4155 will block a user from being invited to a room"""
+        room_id = self.helper.create_room_as(self.alice, tok=self.alice_token)
+
+        self.get_success(
+            self.store.add_account_data_for_user(
+                self.bob,
+                AccountDataTypes.MSC4155_INVITE_PERMISSION_CONFIG,
+                {
+                    "blocked_users": [self.alice],
+                },
+            )
+        )
+
+        self.get_success(
+            self.handler.update_membership(
+                requester=create_requester(self.alice),
+                target=UserID.from_string(self.bob),
+                room_id=room_id,
+                action=Membership.INVITE,
+            ),
+        )
+
+    @override_config({"experimental_features": {"msc4155_enabled": True}})
+    def test_msc4155_block_invite_remote(self) -> None:
+        """Test that MSC4155 will block a remote user from being invited to a room"""
+        # A remote user who sends the invite
+        remote_server = "otherserver"
+        remote_user = "@otheruser:" + remote_server
+
+        self.get_success(
+            self.store.add_account_data_for_user(
+                self.bob,
+                AccountDataTypes.MSC4155_INVITE_PERMISSION_CONFIG,
+                {"blocked_users": [remote_user]},
+            )
+        )
+
+        room_id = self.helper.create_room_as(
+            room_creator=self.alice, tok=self.alice_token
+        )
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        invite_event = event_from_pdu_json(
+            {
+                "type": EventTypes.Member,
+                "content": {"membership": "invite"},
+                "room_id": room_id,
+                "sender": remote_user,
+                "state_key": self.bob,
+                "depth": 32,
+                "prev_events": [],
+                "auth_events": [],
+                "origin_server_ts": self.clock.time_msec(),
+            },
+            room_version,
+        )
+
+        f = self.get_failure(
+            self.fed_handler.on_invite_request(
+                remote_server,
+                invite_event,
+                invite_event.room_version,
+            ),
+            SynapseError,
+        ).value
+        self.assertEqual(f.code, 403)
+        self.assertEqual(f.errcode, "ORG.MATRIX.MSC4155.M_INVITE_BLOCKED")
+
+    @override_config({"experimental_features": {"msc4155_enabled": True}})
+    def test_msc4155_block_invite_remote_server(self) -> None:
+        """Test that MSC4155 will block a remote server's user from being invited to a room"""
+        # A remote user who sends the invite
+        remote_server = "otherserver"
+        remote_user = "@otheruser:" + remote_server
+
+        self.get_success(
+            self.store.add_account_data_for_user(
+                self.bob,
+                AccountDataTypes.MSC4155_INVITE_PERMISSION_CONFIG,
+                {"blocked_servers": [remote_server]},
+            )
+        )
+
+        room_id = self.helper.create_room_as(
+            room_creator=self.alice, tok=self.alice_token
+        )
+        room_version = self.get_success(self.store.get_room_version(room_id))
+
+        invite_event = event_from_pdu_json(
+            {
+                "type": EventTypes.Member,
+                "content": {"membership": "invite"},
+                "room_id": room_id,
+                "sender": remote_user,
+                "state_key": self.bob,
+                "depth": 32,
+                "prev_events": [],
+                "auth_events": [],
+                "origin_server_ts": self.clock.time_msec(),
+            },
+            room_version,
+        )
+
+        f = self.get_failure(
+            self.fed_handler.on_invite_request(
+                remote_server,
+                invite_event,
+                invite_event.room_version,
+            ),
+            SynapseError,
+        ).value
+        self.assertEqual(f.code, 403)
+        self.assertEqual(f.errcode, "ORG.MATRIX.MSC4155.M_INVITE_BLOCKED")

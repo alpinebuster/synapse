@@ -22,11 +22,10 @@
 import logging
 import os
 from typing import Any, Dict, List, Tuple
-from urllib.request import getproxies_environment  # type: ignore
 
 import attr
 
-from synapse.config.server import generate_ip_set
+from synapse.config.server import generate_ip_set, parse_proxy_config
 from synapse.types import JsonDict
 from synapse.util.check_dependencies import check_requirements
 from synapse.util.module_loader import load_module
@@ -61,7 +60,7 @@ THUMBNAIL_SUPPORTED_MEDIA_FORMAT_MAP = {
     "image/png": "png",
 }
 
-HTTP_PROXY_SET_WARNING = """\
+URL_PREVIEW_BLACKLIST_IGNORED_BECAUSE_HTTP_PROXY_SET_WARNING = """\
 The Synapse config url_preview_ip_range_blacklist will be ignored as an HTTP(s) proxy is configured."""
 
 
@@ -119,6 +118,15 @@ def parse_thumbnail_requirements(
     }
 
 
+@attr.s(auto_attribs=True, slots=True, frozen=True)
+class MediaUploadLimit:
+    """A limit on the amount of data a user can upload in a given time
+    period."""
+
+    max_bytes: int
+    time_period_ms: int
+
+
 class ContentRepositoryConfig(Config):
     section = "media"
 
@@ -126,7 +134,7 @@ class ContentRepositoryConfig(Config):
         # Only enable the media repo if either the media repo is enabled or the
         # current worker app is the media repo.
         if (
-            self.root.server.enable_media_repo is False
+            config.get("enable_media_repo", True) is False
             and config.get("worker_app") != "synapse.app.media_repository"
         ):
             self.can_load_media_repo = False
@@ -225,17 +233,25 @@ class ContentRepositoryConfig(Config):
         if self.url_preview_enabled:
             check_requirements("url-preview")
 
-            proxy_env = getproxies_environment()
-            if "url_preview_ip_range_blacklist" not in config:
-                if "http" not in proxy_env or "https" not in proxy_env:
+            proxy_config = parse_proxy_config(config)
+            is_proxy_configured = (
+                proxy_config.http_proxy is not None
+                or proxy_config.https_proxy is not None
+            )
+            if "url_preview_ip_range_blacklist" in config:
+                if is_proxy_configured:
+                    logger.warning(
+                        "".join(
+                            URL_PREVIEW_BLACKLIST_IGNORED_BECAUSE_HTTP_PROXY_SET_WARNING
+                        )
+                    )
+            else:
+                if not is_proxy_configured:
                     raise ConfigError(
                         "For security, you must specify an explicit target IP address "
                         "blacklist in url_preview_ip_range_blacklist for url previewing "
                         "to work"
                     )
-            else:
-                if "http" in proxy_env or "https" in proxy_env:
-                    logger.warning("".join(HTTP_PROXY_SET_WARNING))
 
             # we always block '0.0.0.0' and '::', which are supposed to be
             # unroutable addresses.
@@ -271,6 +287,15 @@ class ContentRepositoryConfig(Config):
             self.media_retention_remote_media_lifetime_ms = self.parse_duration(
                 remote_media_lifetime
             )
+
+        self.enable_authenticated_media = config.get("enable_authenticated_media", True)
+
+        self.media_upload_limits: List[MediaUploadLimit] = []
+        for limit_config in config.get("media_upload_limits", []):
+            time_period_ms = self.parse_duration(limit_config["time_period"])
+            max_bytes = self.parse_size(limit_config["max_size"])
+
+            self.media_upload_limits.append(MediaUploadLimit(max_bytes, time_period_ms))
 
     def generate_config_section(self, data_dir_path: str, **kwargs: Any) -> str:
         assert data_dir_path is not None

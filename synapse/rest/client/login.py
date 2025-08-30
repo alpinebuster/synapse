@@ -30,10 +30,9 @@ from typing import (
     List,
     Optional,
     Tuple,
+    TypedDict,
     Union,
 )
-
-from typing_extensions import TypedDict
 
 from synapse.api.constants import ApprovalNoticeMedium
 from synapse.api.errors import (
@@ -43,6 +42,7 @@ from synapse.api.errors import (
     NotApprovedError,
     SynapseError,
     UserDeactivatedError,
+    UserLockedError,
 )
 from synapse.api.ratelimiting import Ratelimiter
 from synapse.api.urls import CLIENT_API_PREFIX
@@ -268,7 +268,7 @@ class LoginRestServlet(RestServlet):
                     approval_notice_medium=ApprovalNoticeMedium.NONE,
                 )
 
-        well_known_data = self._well_known_builder.get_well_known()
+        well_known_data = await self._well_known_builder.get_well_known()
         if well_known_data:
             result["well_known"] = well_known_data
         return 200, result
@@ -314,7 +314,9 @@ class LoginRestServlet(RestServlet):
             should_issue_refresh_token=should_issue_refresh_token,
             # The user represented by an appservice's configured sender_localpart
             # is not actually created in Synapse.
-            should_check_deactivated=qualified_user_id != appservice.sender,
+            should_check_deactivated_or_locked=(
+                qualified_user_id != appservice.sender.to_string()
+            ),
             request_info=request_info,
         )
 
@@ -363,11 +365,12 @@ class LoginRestServlet(RestServlet):
         login_submission: JsonDict,
         callback: Optional[Callable[[LoginResponse], Awaitable[None]]] = None,
         create_non_existent_users: bool = False,
+        default_display_name: Optional[str] = None,
         ratelimit: bool = True,
         auth_provider_id: Optional[str] = None,
         should_issue_refresh_token: bool = False,
         auth_provider_session_id: Optional[str] = None,
-        should_check_deactivated: bool = True,
+        should_check_deactivated_or_locked: bool = True,
         *,
         request_info: RequestInfo,
     ) -> LoginResponse:
@@ -389,8 +392,8 @@ class LoginRestServlet(RestServlet):
             should_issue_refresh_token: True if this login should issue
                 a refresh token alongside the access token.
             auth_provider_session_id: The session ID got during login from the SSO IdP.
-            should_check_deactivated: True if the user should be checked for
-                deactivation status before logging in.
+            should_check_deactivated_or_locked: True if the user should be checked for
+                deactivation or locked status before logging in.
 
                 This exists purely for appservice's configured sender_localpart
                 which doesn't have an associated user in the database.
@@ -410,15 +413,19 @@ class LoginRestServlet(RestServlet):
             canonical_uid = await self.auth_handler.check_user_exists(user_id)
             if not canonical_uid:
                 canonical_uid = await self.registration_handler.register_user(
-                    localpart=UserID.from_string(user_id).localpart
+                    localpart=UserID.from_string(user_id).localpart,
+                    default_display_name=default_display_name,
                 )
             user_id = canonical_uid
 
-        # If the account has been deactivated, do not proceed with the login.
-        if should_check_deactivated:
+        # If the account has been deactivated or locked, do not proceed with the login.
+        if should_check_deactivated_or_locked:
             deactivated = await self._main_store.get_user_deactivated_status(user_id)
             if deactivated:
                 raise UserDeactivatedError("This account has been deactivated")
+            locked = await self._main_store.get_user_locked_status(user_id)
+            if locked:
+                raise UserLockedError()
 
         device_id = login_submission.get("device_id")
 
@@ -546,11 +553,14 @@ class LoginRestServlet(RestServlet):
         Returns:
             The body of the JSON response.
         """
-        user_id = self.hs.get_jwt_handler().validate_login(login_submission)
+        user_id, default_display_name = self.hs.get_jwt_handler().validate_login(
+            login_submission
+        )
         return await self._complete_login(
             user_id,
             login_submission,
             create_non_existent_users=True,
+            default_display_name=default_display_name,
             should_issue_refresh_token=should_issue_refresh_token,
             request_info=request_info,
         )
@@ -705,7 +715,7 @@ class CasTicketServlet(RestServlet):
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
-    if hs.config.experimental.msc3861.enabled:
+    if hs.config.mas.enabled or hs.config.experimental.msc3861.enabled:
         return
 
     LoginRestServlet(hs).register(http_server)
