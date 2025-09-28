@@ -1882,6 +1882,24 @@ database migrations are complete. You should wait until background updates from
 each upgrade are complete before moving on to the next upgrade, to avoid
 stacking them up. You can monitor the currently running background updates with
 <a href="usage/administration/admin_api/background_updates.html#status">the Admin API</a>.</p>
+<h1 id="upgrading-to-v11390"><a class="header" href="#upgrading-to-v11390">Upgrading to v1.139.0</a></h1>
+<h2 id="register-requests-from-old-application-service-implementations-may-break-when-using-mas"><a class="header" href="#register-requests-from-old-application-service-implementations-may-break-when-using-mas"><code>/register</code> requests from old application service implementations may break when using MAS</a></h2>
+<p>Application Services that do not set <code>inhibit_login=true</code> when calling <code>POST /_matrix/client/v3/register</code> will receive the error
+<code>IO.ELEMENT.MSC4190.M_APPSERVICE_LOGIN_UNSUPPORTED</code> in response. This is a
+result of <a href="https://github.com/matrix-org/matrix-spec-proposals/pull/4190">MSC4190: Device management for application
+services</a> which
+adds new endpoints for application services to create encryption-ready devices
+with other than <code>/login</code> or <code>/register</code> without <code>inhibit_login=true</code>.</p>
+<p>If an application service you use starts to fail with the mentioned error,
+ensure it is up to date. If it is, then kindly let the author know that they
+need to update their implementation to call <code>/register</code> with
+<code>inhibit_login=true</code>.</p>
+<h1 id="upgrading-to-v11382"><a class="header" href="#upgrading-to-v11382">Upgrading to v1.138.2</a></h1>
+<h2 id="drop-support-for-ubuntu-2410-oracular-oriole-and-add-support-for-ubuntu-2504-plucky-puffin"><a class="header" href="#drop-support-for-ubuntu-2410-oracular-oriole-and-add-support-for-ubuntu-2504-plucky-puffin">Drop support for Ubuntu 24.10 Oracular Oriole, and add support for Ubuntu 25.04 Plucky Puffin</a></h2>
+<p>Ubuntu 24.10 Oracular Oriole <a href="https://endoflife.date/ubuntu">has been end-of-life since 10 Jul
+2025</a>. This release drops support for Ubuntu
+24.10, and in its place adds support for Ubuntu 25.04 Plucky Puffin.</p>
+<p>This notice also applies to the v1.139.0 release.</p>
 <h1 id="upgrading-to-v11360"><a class="header" href="#upgrading-to-v11360">Upgrading to v1.136.0</a></h1>
 <h2 id="deprecate-run_as_background_process-exported-as-part-of-the-module-api-interface-in-favor-of-moduleapirun_as_background_process"><a class="header" href="#deprecate-run_as_background_process-exported-as-part-of-the-module-api-interface-in-favor-of-moduleapirun_as_background_process">Deprecate <code>run_as_background_process</code> exported as part of the module API interface in favor of <code>ModuleApi.run_as_background_process</code></a></h2>
 <p>The <code>run_as_background_process</code> function is now a method of the <code>ModuleApi</code> class. If
@@ -5819,8 +5837,10 @@ Setting this to a high value allows users to report content quickly, possibly in
 </code></pre>
 <hr />
 <h3 id="media_upload_limits"><a class="header" href="#media_upload_limits"><code>media_upload_limits</code></a></h3>
-<p><em>(array)</em> A list of media upload limits defining how much data a given user can upload in a given time period.</p>
+<p><em>(array)</em> A list of media upload limits defining how much data a given user can upload in a given time period.
+These limits are applied in addition to the <code>max_upload_size</code> limit above (which applies to individual uploads).</p>
 <p>An empty list means no limits are applied.</p>
+<p>These settings can be overridden using the <code>get_media_upload_limits_for_user</code> module API <a href="usage/configuration/../../modules/media_repository_callbacks.html#get_media_upload_limits_for_user">callback</a>.</p>
 <p>Defaults to <code>[]</code>.</p>
 <p>Example configuration:</p>
 <pre><code class="language-yaml">media_upload_limits:
@@ -8098,7 +8118,7 @@ handlers:
 loggers:
     synapse:
         level: INFO
-        handlers: [remote]
+        handlers: [file]
     synapse.storage.SQL:
         level: WARNING
 </code></pre>
@@ -8599,7 +8619,8 @@ has more information on setting up SiWA.</p>
 <li>Create an application for synapse in Authentik and link it to the provider.</li>
 <li>Note the slug of your application, Client ID and Client Secret.</li>
 </ol>
-<p>Note: RSA keys must be used for signing for Authentik, ECC keys do not work.</p>
+<p>Note: RSA keys must be used for signing for Authentik, ECC keys do not work.
+Note: The provider must have a signing key set and must not use an encryption key.</p>
 <p>Synapse config:</p>
 <pre><code class="language-yaml">oidc_providers:
   - idp_id: authentik
@@ -8616,6 +8637,12 @@ has more information on setting up SiWA.</p>
       config:
         localpart_template: &quot;{{ user.preferred_username }}&quot;
         display_name_template: &quot;{{ user.preferred_username|capitalize }}&quot; # TO BE FILLED: If your users have names in Authentik and you want those in Synapse, this should be replaced with user.name|capitalize.
+[...]
+jwt_config:
+    enabled: true
+    secret: &quot;your client secret&quot; # TO BE FILLED (same as `client_secret` above)
+    algorithm: &quot;RS256&quot;
+    # (...other fields)
 </code></pre>
 <h3 id="dex"><a class="header" href="#dex">Dex</a></h3>
 <p><a href="https://github.com/dexidp/dex">Dex</a> is a simple, open-source OpenID Connect Provider.
@@ -10585,11 +10612,14 @@ this callback.</p>
 <p><em>Changed in Synapse v1.132.0: Added the <code>room_config</code> argument. Callbacks that only expect a single <code>user_id</code> argument are still supported.</em></p>
 <pre><code class="language-python">async def user_may_create_room(user_id: str, room_config: synapse.module_api.JsonDict) -&gt; Union[&quot;synapse.module_api.NOT_SPAM&quot;, &quot;synapse.module_api.errors.Codes&quot;, bool]
 </code></pre>
-<p>Called when processing a room creation request.</p>
+<p>Called when processing a room creation or room upgrade request.</p>
 <p>The arguments passed to this callback are:</p>
 <ul>
 <li><code>user_id</code>: The Matrix user ID of the user (e.g. <code>@alice:example.com</code>).</li>
-<li><code>room_config</code>: The contents of the body of a <a href="https://spec.matrix.org/latest/client-server-api/#post_matrixclientv3createroom">/createRoom request</a> as a dictionary.</li>
+<li><code>room_config</code>: The contents of the body of the <a href="https://spec.matrix.org/v1.15/client-server-api/#post_matrixclientv3createroom"><code>/createRoom</code> request</a> as a dictionary.
+For a <a href="https://spec.matrix.org/v1.15/client-server-api/#post_matrixclientv3roomsroomidupgrade">room upgrade request</a> it is a synthesised subset of what an equivalent
+<code>/createRoom</code> request would have looked like. Specifically, it contains the <code>creation_content</code> (linking to the previous room) and <code>initial_state</code> (containing a
+subset of the state of the previous room).</li>
 </ul>
 <p>The callback must return one of:</p>
 <ul>
@@ -11685,6 +11715,53 @@ enforce a different limit for the particular user.</p>
 returns <code>True</code>, Synapse falls through to the next one. The value of the first callback that
 returns <code>False</code> will be used. If this happens, Synapse will not call any of the subsequent
 implementations of this callback.</p>
+<h3 id="get_media_upload_limits_for_user"><a class="header" href="#get_media_upload_limits_for_user"><code>get_media_upload_limits_for_user</code></a></h3>
+<p><em>First introduced in Synapse v1.139.0</em></p>
+<pre><code class="language-python">async def get_media_upload_limits_for_user(user_id: str, size: int) -&gt; Optional[List[synapse.module_api.MediaUploadLimit]]
+</code></pre>
+<p><strong><span style="color:red">
+Caution: This callback is currently experimental. The method signature or behaviour
+may change without notice.
+</span></strong></p>
+<p>Called when processing a request to store content in the media repository. This can be used to dynamically override
+the <a href="modules/../usage/configuration/config_documentation.html#media_upload_limits">media upload limits configuration</a>.</p>
+<p>The arguments passed to this callback are:</p>
+<ul>
+<li><code>user_id</code>: The Matrix user ID of the user (e.g. <code>@alice:example.com</code>) making the request.</li>
+</ul>
+<p>If the callback returns a list then it will be used as the limits instead of those in the configuration (if any).</p>
+<p>If an empty list is returned then no limits are applied (<strong>warning:</strong> users will be able
+to upload as much data as they desire).</p>
+<p>If multiple modules implement this callback, they will be considered in order. If a
+callback returns <code>None</code>, Synapse falls through to the next one. The value of the first
+callback that does not return <code>None</code> will be used. If this happens, Synapse will not call
+any of the subsequent implementations of this callback.</p>
+<p>If there are no registered modules, or if all modules return <code>None</code>, then
+the default
+<a href="modules/../usage/configuration/config_documentation.html#media_upload_limits">media upload limits configuration</a>
+will be used.</p>
+<h3 id="on_media_upload_limit_exceeded"><a class="header" href="#on_media_upload_limit_exceeded"><code>on_media_upload_limit_exceeded</code></a></h3>
+<p><em>First introduced in Synapse v1.139.0</em></p>
+<pre><code class="language-python">async def on_media_upload_limit_exceeded(user_id: str, limit: synapse.module_api.MediaUploadLimit, sent_bytes: int, attempted_bytes: int) -&gt; None
+</code></pre>
+<p><strong><span style="color:red">
+Caution: This callback is currently experimental. The method signature or behaviour
+may change without notice.
+</span></strong></p>
+<p>Called when a user attempts to upload media that would exceed a
+<a href="modules/../usage/configuration/config_documentation.html#media_upload_limits">configured media upload limit</a>.</p>
+<p>This callback will only be called on workers which handle
+<a href="https://spec.matrix.org/v1.15/client-server-api/#post_matrixmediav3upload">POST /_matrix/media/v3/upload</a>
+requests.</p>
+<p>This could be used to inform the user that they have reached a media upload limit through
+some external method.</p>
+<p>The arguments passed to this callback are:</p>
+<ul>
+<li><code>user_id</code>: The Matrix user ID of the user (e.g. <code>@alice:example.com</code>) making the request.</li>
+<li><code>limit</code>: The <code>synapse.module_api.MediaUploadLimit</code> representing the limit that was reached.</li>
+<li><code>sent_bytes</code>: The number of bytes already sent during the period of the limit.</li>
+<li><code>attempted_bytes</code>: The number of bytes that the user attempted to send.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="ratelimit-callbacks"><a class="header" href="#ratelimit-callbacks">Ratelimit callbacks</a></h1>
 <p>Ratelimit callbacks allow module developers to override ratelimit settings dynamically whilst
 Synapse is running. Ratelimit callbacks can be registered using the module API's
@@ -13087,6 +13164,33 @@ However, it only shows media from unencrypted events or rooms.</p>
 the use of the
 <a href="admin_api/user_admin_api.html#list-media-uploaded-by-a-user">List media uploaded by a user</a>
 Admin API.</p>
+<h2 id="query-a-piece-of-media-by-id"><a class="header" href="#query-a-piece-of-media-by-id">Query a piece of media by ID</a></h2>
+<p>This API returns information about a piece of local or cached remote media given the origin server name and media id. If
+information is requested for remote media which is not cached the endpoint will return 404. </p>
+<p>Request:</p>
+<pre><code class="language-http">GET /_synapse/admin/v1/media/&lt;origin&gt;/&lt;media_id&gt;
+</code></pre>
+<p>The API returns a JSON body with media info like the following:</p>
+<p>Response:</p>
+<pre><code class="language-json">{
+  &quot;media_info&quot;: {
+    &quot;media_origin&quot;: &quot;remote.com&quot;,
+    &quot;user_id&quot;: null,
+    &quot;media_id&quot;: &quot;sdginwegWEG&quot;,
+    &quot;media_type&quot;: &quot;img/png&quot;,
+    &quot;media_length&quot;: 67,
+    &quot;upload_name&quot;:  &quot;test.png&quot;,
+    &quot;created_ts&quot;:  300,
+    &quot;filesystem_id&quot;:  &quot;wgeweg&quot;,
+    &quot;url_cache&quot;: null,
+    &quot;last_access_ts&quot;: 400,
+    &quot;quarantined_by&quot;:  null,
+    &quot;authenticated&quot;:  false,
+    &quot;safe_from_quarantine&quot;: null,
+    &quot;sha256&quot;: &quot;ebf4f635a17d10d6eb46ba680b70142419aa3220f228001a036d311a22ee9d2a&quot;
+  }
+}
+</code></pre>
 <h1 id="quarantine-media"><a class="header" href="#quarantine-media">Quarantine media</a></h1>
 <p>Quarantining media means that it is marked as inaccessible by users. It applies
 to any local media, and any locally-cached copies of remote media.</p>
@@ -19165,6 +19269,22 @@ can be written much more succinctly as:</p>
 def do_request_handling():
     logger.debug(&quot;phew&quot;)
 </code></pre>
+<h3 id="the-sentinel-context"><a class="header" href="#the-sentinel-context">The <code>sentinel</code> context</a></h3>
+<p>The default logcontext is <code>synapse.logging.context.SENTINEL_CONTEXT</code>, which is an empty
+sentinel value to represent the root logcontext. This is what is used when there is no
+other logcontext set. The phrase &quot;clear/reset the logcontext&quot; means to set the current
+logcontext to the <code>sentinel</code> logcontext.</p>
+<p>No CPU/database usage metrics are recorded against the <code>sentinel</code> logcontext.</p>
+<p>Ideally, nothing from the Synapse homeserver would be logged against the <code>sentinel</code>
+logcontext as we want to know which server the logs came from. In practice, this is not
+always the case yet especially outside of request handling.</p>
+<p>Global things outside of Synapse (e.g. Twisted reactor code) should run in the
+<code>sentinel</code> logcontext. It's only when it calls into application code that a logcontext
+gets activated. This means the reactor should be started in the <code>sentinel</code> logcontext,
+and any time an awaitable yields control back to the reactor, it should reset the
+logcontext to be the <code>sentinel</code> logcontext. This is important to avoid leaking the
+current logcontext to the reactor (which would then get picked up and associated with
+the next thing the reactor does).</p>
 <h2 id="using-logcontexts-with-awaitables"><a class="header" href="#using-logcontexts-with-awaitables">Using logcontexts with awaitables</a></h2>
 <p>Awaitables break the linear flow of code so that there is no longer a single entry point
 where we should set the logcontext and a single exit point where we should remove it.</p>
@@ -19268,6 +19388,139 @@ def get_sleep_deferred(seconds):
 <code>context.make_deferred_yieldable</code>:</p>
 <pre><code class="language-python">async def sleep(seconds):
     return await context.make_deferred_yieldable(get_sleep_deferred(seconds))
+</code></pre>
+<h2 id="deferred-callbacks"><a class="header" href="#deferred-callbacks">Deferred callbacks</a></h2>
+<p>When a deferred callback is called, it inherits the current logcontext. The deferred
+callback chain can resume a coroutine, which if following our logcontext rules, will
+restore its own logcontext, then run:</p>
+<ul>
+<li>until it yields control back to the reactor, setting the sentinel logcontext</li>
+<li>or until it finishes, restoring the logcontext it was started with (calling context)</li>
+</ul>
+<p>This behavior creates two specific issues:</p>
+<p><strong>Issue 1:</strong> The first issue is that the callback may have reset the logcontext to the
+sentinel before returning. This means our calling function will continue with the
+sentinel logcontext instead of the logcontext it was started with (bad).</p>
+<p><strong>Issue 2:</strong> The second issue is that the current logcontext that called the deferred
+callback could finish before the callback finishes (bad).</p>
+<p>In the following example, the deferred callback is called with the &quot;main&quot; logcontext and
+runs until we yield control back to the reactor in the <code>await</code> inside <code>clock.sleep(0)</code>.
+Since <code>clock.sleep(0)</code> follows our logcontext rules, it sets the logcontext to the
+sentinel before yielding control back to the reactor. Our <code>main</code> function continues with
+the sentinel logcontext (first bad thing) instead of the &quot;main&quot; logcontext. Then the
+<code>with LoggingContext(&quot;main&quot;)</code> block exits, finishing the &quot;main&quot; logcontext and yielding
+control back to the reactor again. Finally, later on when <code>clock.sleep(0)</code> completes,
+our <code>with LoggingContext(&quot;competing&quot;)</code> block exits, and restores the previous &quot;main&quot;
+logcontext which has already finished, resulting in <code>WARNING: Re-starting finished log context main</code> and leaking the <code>main</code> logcontext into the reactor which will then
+erronously be associated with the next task the reactor picks up.</p>
+<pre><code class="language-python">async def competing_callback():
+    # Since this is run with the &quot;main&quot; logcontext, when the &quot;competing&quot;
+    # logcontext exits, it will restore the previous &quot;main&quot; logcontext which has
+    # already finished and results in &quot;WARNING: Re-starting finished log context main&quot;
+    # and leaking the `main` logcontext into the reactor.
+    with LoggingContext(&quot;competing&quot;):
+        await clock.sleep(0)
+
+def main():
+    with LoggingContext(&quot;main&quot;):
+        d = defer.Deferred()
+        d.addCallback(lambda _: defer.ensureDeferred(competing_callback()))
+        # Call the callback within the &quot;main&quot; logcontext.
+        d.callback(None)
+        # Bad: This will be logged against sentinel logcontext
+        logger.debug(&quot;ugh&quot;)
+
+main()
+</code></pre>
+<p><strong>Solution 1:</strong> We could of course fix this by following the general rule of &quot;always
+await your awaitables&quot;:</p>
+<pre><code class="language-python">async def main():
+    with LoggingContext(&quot;main&quot;):
+        d = defer.Deferred()
+        d.addCallback(lambda _: defer.ensureDeferred(competing_callback()))
+        d.callback(None)
+        # Wait for `d` to finish before continuing so the &quot;main&quot; logcontext is
+        # still active. This works because `d` already follows our logcontext
+        # rules. If not, we would also have to use `make_deferred_yieldable(d)`.
+        await d
+        # Good: This will be logged against the &quot;main&quot; logcontext
+        logger.debug(&quot;phew&quot;)
+</code></pre>
+<p><strong>Solution 2:</strong> We could also fix this by surrounding the call to <code>d.callback</code> with a
+<code>PreserveLoggingContext</code>, which will reset the logcontext to the sentinel before calling
+the callback, and restore the &quot;main&quot; logcontext afterwards before continuing the <code>main</code>
+function. This solves the problem because when the &quot;competing&quot; logcontext exits, it will
+restore the sentinel logcontext which is never finished by its nature, so there is no
+warning and no leakage into the reactor.</p>
+<pre><code class="language-python">async def main():
+    with LoggingContext(&quot;main&quot;):
+        d = defer.Deferred()
+        d.addCallback(lambda _: defer.ensureDeferred(competing_callback()))
+        d.callback(None)
+        with PreserveLoggingContext():
+            # Call the callback with the sentinel logcontext.
+            d.callback(None)
+        # Good: This will be logged against the &quot;main&quot; logcontext
+        logger.debug(&quot;phew&quot;)
+</code></pre>
+<p><strong>Solution 3:</strong> But let's say you <em>do</em> want to run (fire-and-forget) the deferred
+callback in the current context without running into issues:</p>
+<p>We can solve the first issue by using <code>run_in_background(...)</code> to run the callback in
+the current logcontext and it handles the magic behind the scenes of a) restoring the
+calling logcontext before returning to the caller and b) resetting the logcontext to the
+sentinel after the deferred completes and we yield control back to the reactor to avoid
+leaking the logcontext into the reactor.</p>
+<p>To solve the second issue, we can extend the lifetime of the &quot;main&quot; logcontext by
+avoiding the <code>LoggingContext</code>'s context manager lifetime methods
+(<code>__enter__</code>/<code>__exit__</code>). We can still set &quot;main&quot; as the current logcontext by using
+<code>PreserveLoggingContext</code> and passing in the &quot;main&quot; logcontext.</p>
+<pre><code class="language-python">async def main():
+    main_context = LoggingContext(&quot;main&quot;)
+    with PreserveLoggingContext(main_context):
+        d = defer.Deferred()
+        d.addCallback(lambda _: defer.ensureDeferred(competing_callback()))
+        # The whole lambda will be run in the &quot;main&quot; logcontext. But we're using
+        # a trick to return the deferred `d` itself so that `run_in_background`
+        # will wait on that to complete and reset the logcontext to the sentinel
+        # when it does to avoid leaking the &quot;main&quot; logcontext into the reactor.
+        run_in_background(lambda: (d.callback(None), d)[1])
+        # Good: This will be logged against the &quot;main&quot; logcontext
+        logger.debug(&quot;phew&quot;)
+
+...
+
+# Wherever possible, it's best to finish the logcontext by calling `__exit__` at some
+# point. This allows us to catch bugs if we later try to erroneously restart a finished
+# logcontext.
+#
+# Since the &quot;main&quot; logcontext stores the `LoggingContext.previous_context` when it is
+# created, we can wrap this call in `PreserveLoggingContext()` to restore the correct
+# previous logcontext. Our goal is to have the calling context remain unchanged after
+# finishing the &quot;main&quot; logcontext.
+with PreserveLoggingContext():
+    # Finish the &quot;main&quot; logcontext
+    with main_context:
+        # Empty block - We're just trying to call `__exit__` on the &quot;main&quot; context
+        # manager to finish it. We can't call `__exit__` directly as the code expects us
+        # to `__enter__` before calling `__exit__` to `start`/`stop` things
+        # appropriately. And in any case, it's probably best not to call the internal
+        # methods directly.
+        pass
+</code></pre>
+<p>The same thing applies if you have some deferreds stored somewhere which you want to
+callback in the current logcontext.</p>
+<h3 id="deferred-errbacks-and-cancellations"><a class="header" href="#deferred-errbacks-and-cancellations">Deferred errbacks and cancellations</a></h3>
+<p>The same care should be taken when calling errbacks on deferreds. An errback and
+callback act the same in this regard (see section above).</p>
+<pre><code class="language-python">d = defer.Deferred()
+d.addErrback(some_other_function)
+d.errback(failure)
+</code></pre>
+<p>Additionally, cancellation is the same as directly calling the errback with a
+<code>twisted.internet.defer.CancelledError</code>:</p>
+<pre><code class="language-python">d = defer.Deferred()
+d.addErrback(some_other_function)
+d.cancel()
 </code></pre>
 <h2 id="fire-and-forget"><a class="header" href="#fire-and-forget">Fire-and-forget</a></h2>
 <p>Sometimes you want to fire off a chain of execution, but not wait for
@@ -20507,11 +20760,12 @@ table. Each subject can have only one.</li>
 <h3 id="overview-4"><a class="header" href="#overview-4">Overview</a></h3>
 <p>Stats correspond to the present values. Current rows contain the most up-to-date
 statistics for a room. Each subject can only have one entry.</p>
-<div style="break-before: page; page-break-before: always;"></div><h1 id="deprecation-policy-for-platform-dependencies"><a class="header" href="#deprecation-policy-for-platform-dependencies">Deprecation Policy for Platform Dependencies</a></h1>
-<p>Synapse has a number of platform dependencies, including Python, Rust, 
-PostgreSQL and SQLite. This document outlines the policy towards which versions 
-we support, and when we drop support for versions in the future.</p>
-<h2 id="policy"><a class="header" href="#policy">Policy</a></h2>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="deprecation-policy"><a class="header" href="#deprecation-policy">Deprecation Policy</a></h1>
+<p>Synapse has a number of <strong>platform dependencies</strong> (Python, Rust, PostgreSQL, and SQLite)
+and <strong>application dependencies</strong> (Python and Rust packages). This document outlines the
+policy towards which versions we support, and when we drop support for versions in the
+future.</p>
+<h2 id="platform-dependencies"><a class="header" href="#platform-dependencies">Platform Dependencies</a></h2>
 <p>Synapse follows the upstream support life cycles for Python and PostgreSQL,
 i.e. when a version reaches End of Life Synapse will withdraw support for that
 version in future releases.</p>
@@ -20525,7 +20779,7 @@ people building from source should ensure they can fetch recent versions of Rust
 <p>The oldest supported version of SQLite is the version
 <a href="https://packages.debian.org/bullseye/libsqlite3-0">provided</a> by
 <a href="https://wiki.debian.org/DebianOldStable">Debian oldstable</a>.</p>
-<h2 id="context"><a class="header" href="#context">Context</a></h2>
+<h3 id="context"><a class="header" href="#context">Context</a></h3>
 <p>It is important for system admins to have a clear understanding of the platform
 requirements of Synapse and its deprecation policies so that they can
 effectively plan upgrading their infrastructure ahead of time. This is
@@ -20545,6 +20799,34 @@ the ecosystem.</p>
 release&quot;; bugfixes are published for the latest minor release only. We chose to
 track Debian's oldstable as this is relatively conservative, predictably updated
 and is consistent with the <code>.deb</code> packages released by Matrix.org.</p>
+<h2 id="application-dependencies"><a class="header" href="#application-dependencies">Application dependencies</a></h2>
+<p>For application-level Python dependencies, we often specify loose version constraints
+(ex. <code>&gt;=X.Y.Z</code>) to be forwards compatible with any new versions. Upper bounds (<code>&lt;A.B.C</code>)
+are only added when necessary to prevent known incompatibilities.</p>
+<p>When selecting a minimum version, while we are mindful of the impact on downstream
+package maintainers, our primary focus is on the maintainability and progress of Synapse
+itself.</p>
+<p>For developers, a Python dependency version can be considered a &quot;no-brainer&quot; upgrade once it is
+available in both the latest <a href="https://packages.debian.org/stable/">Debian Stable</a> and
+<a href="https://launchpad.net/ubuntu">Ubuntu LTS</a> repositories. No need to burden yourself with
+extra scrutiny or consideration at this point.</p>
+<p>We aggressively update Rust dependencies. Since these are statically linked and managed
+entirely by <code>cargo</code> during build, they <em>can</em> pose no ongoing maintenance burden on others.
+This allows us to freely upgrade to leverage the latest ecosystem advancements assuming
+they don't have their own system-level dependencies.</p>
+<h3 id="context-1"><a class="header" href="#context-1">Context</a></h3>
+<p>Because Python dependencies can easily be managed in a virtual environment, we are less
+concerned about the criteria for selecting minimum versions. The only thing of concern
+is making sure we're not making it unnecessarily difficult for downstream package
+maintainers. Generally, this just means avoiding the bleeding edge for a few months.</p>
+<p>The situation for Rust dependencies is fundamentally different. For packagers, the
+concerns around Python dependency versions do not apply. The <code>cargo</code> tool handles
+downloading and building all libraries to satisfy dependencies, and these libraries are
+statically linked into the final binary. This means that from a packager's perspective,
+the Rust dependency versions are an internal build detail, not a runtime dependency to
+be managed on the target system. Consequently, we have even greater flexibility to
+upgrade Rust dependencies as needed for the project. Some distros (e.g. Fedora) do
+package Rust libraries, but this appears to be the outlier rather than the norm.</p>
 <div style="break-before: page; page-break-before: always;"></div><h2 id="summary-of-performance-impact-of-running-on-resource-constrained-devices-such-as-sbcs"><a class="header" href="#summary-of-performance-impact-of-running-on-resource-constrained-devices-such-as-sbcs">Summary of performance impact of running on resource constrained devices such as SBCs</a></h2>
 <p>I've been running my homeserver on a cubietruck at home now for some time and am often replying to statements like &quot;you need loads of ram to join large rooms&quot; with &quot;it works fine for me&quot;. I thought it might be useful to curate a summary of the issues you're likely to run into to help as a scaling-down guide, maybe highlight these for development work or end up as documentation. It seems that once you get up to about 4x1.5GHz arm64 4GiB these issues are no longer a problem.</p>
 <ul>
