@@ -44,6 +44,7 @@ from synapse.replication.tcp.streams import (
     UnPartialStatedEventStream,
     UnPartialStatedRoomStream,
 )
+from synapse.replication.tcp.streams._base import ThreadSubscriptionsStream
 from synapse.replication.tcp.streams.events import (
     EventsStream,
     EventsStreamEventRow,
@@ -255,6 +256,12 @@ class ReplicationDataHandler:
                 self._state_storage_controller.notify_event_un_partial_stated(
                     row.event_id
                 )
+        elif stream_name == ThreadSubscriptionsStream.NAME:
+            self.notifier.on_new_event(
+                StreamKeyType.THREAD_SUBSCRIPTIONS,
+                token,
+                users=[row.user_id for row in rows],
+            )
 
         await self._presence_handler.process_replication_rows(
             stream_name, instance_name, token, rows
@@ -429,7 +436,9 @@ class FederationSenderHandler:
         # to. This is always set before we use it.
         self.federation_position: Optional[int] = None
 
-        self._fed_position_linearizer = Linearizer(name="_fed_position_linearizer")
+        self._fed_position_linearizer = Linearizer(
+            name="_fed_position_linearizer", clock=hs.get_clock()
+        )
 
     async def process_replication_rows(
         self, stream_name: str, token: int, rows: list
