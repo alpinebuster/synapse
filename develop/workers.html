@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-65295da9.js";
+            window.path_to_searchindex_js = "searchindex-c5da4dde.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-4dc10a98.js"></script>
@@ -296,7 +296,7 @@ worker_replication_secret: ""
 
 redis:
     enabled: true
-    # For additional Redis configuration options (TLS, authentication, etc.), 
+    # For additional Redis configuration options (TLS, authentication, etc.),
     # see the Synapse configuration documentation:
     # https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html#redis
 
@@ -943,7 +943,7 @@ changes to the config are required.</p>
 <code>worker_app</code> option in the worker configs, and where worker are started (e.g.
 in systemd service files, but not required for synctl).</p>
 <h2 id="architectural-diagram"><a class="header" href="#architectural-diagram">Architectural diagram</a></h2>
-<p>The following shows an example setup using Redis and a reverse proxy:</p>
+<p>The following shows an example setup using Redis and a reverse proxy, see more details in <a href="how-we-fixed-synapse-s-scalability.html">scalability</a>:</p>
 <pre><code>                     Clients &amp; Federation
                               |
                               v
