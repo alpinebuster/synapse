@@ -120,7 +120,7 @@ worker_replication_secret: ""
 
 redis:
     enabled: true
-    # For additional Redis configuration options (TLS, authentication, etc.), 
+    # For additional Redis configuration options (TLS, authentication, etc.),
     # see the Synapse configuration documentation:
     # https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html#redis
 
@@ -870,7 +870,7 @@ in systemd service files, but not required for synctl).
 
 ## Architectural diagram
 
-The following shows an example setup using Redis and a reverse proxy:
+The following shows an example setup using Redis and a reverse proxy, see more details in [scalability](how-we-fixed-synapse-s-scalability.md):
 
 ```
                      Clients & Federation
