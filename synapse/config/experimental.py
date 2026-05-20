@@ -386,9 +386,6 @@ class ExperimentalConfig(Config):
         # MSC3814 (dehydrated devices with SSSS)
         self.msc3814_enabled: bool = experimental.get("msc3814_enabled", False)
 
-        # MSC3266 (room summary api)
-        self.msc3266_enabled: bool = experimental.get("msc3266_enabled", False)
-
         # MSC2409 (this setting only relates to optionally sending to-device messages).
         # Presence, typing and read receipt EDUs are already sent to application services that
         # have opted in to receive them. If enabled, this adds to-device messages to that list.
@@ -616,3 +613,7 @@ class ExperimentalConfig(Config):
         # Tracked in: https://github.com/element-hq/synapse/issues/19691
         # Note that this is only applicable to legacy auth, not MAS integration (OAuth 2.0).
         self.msc4450_enabled: bool = experimental.get("msc4450_enabled", False)
+
+        # MSC4455: Preview URL capability
+        # Tracked in: https://github.com/element-hq/synapse/issues/19719
+        self.msc4452_enabled: bool = experimental.get("msc4452_enabled", False)
