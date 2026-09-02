@@ -38,7 +38,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-65f9128a.js";
+            window.path_to_searchindex_js = "searchindex-29b683b3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-64310643.js"></script>
@@ -988,8 +988,10 @@ has already occurred, and such duplicate rows will need to be manually removed.<
 <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html">nginx</a>,
 <a href="https://httpd.apache.org/docs/current/mod/mod_proxy_http.html">Apache</a>,
 <a href="https://caddyserver.com/docs/quick-starts/reverse-proxy">Caddy</a>,
-<a href="https://www.haproxy.org/">HAProxy</a> or
-<a href="https://man.openbsd.org/relayd.8">relayd</a> in front of Synapse.
+<a href="https://www.haproxy.org/">HAProxy</a>,
+<a href="https://man.openbsd.org/relayd.8">relayd</a> or
+<a href="https://www.lighttpd.net/">lighttpd</a>
+in front of Synapse.
 This has the advantage of being able to expose the default HTTPS port (443) to Matrix
 clients without requiring Synapse to bind to a privileged port (port numbers less than
 1024), avoiding the need for <code>CAP_NET_BIND_SERVICE</code> or running as root.</p>
@@ -1252,6 +1254,84 @@ relay "matrix_federation" {
     listen on egress port 8448 tls
     protocol "matrix"
     forward to &lt;matrixserver&gt; port 8008 check tcp
+}
+</code></pre>
+<h3 id="lighttpd"><a class="header" href="#lighttpd">lighttpd</a></h3>
+<pre><code class="language-conf">server.modules = (
+    "mod_rewrite",
+    "mod_redirect",
+    "mod_access",
+    "mod_setenv",
+    "mod_openssl",
+    "mod_proxy",
+    "mod_accesslog"
+)
+
+server.username      = "lighttpd"
+server.groupname     = "lighttpd"
+
+# We set this to "disable" and use IPv6 `[::]` explicitly below,
+# in order to listen on all incoming IPv6 addresses.
+#
+# If you only want to listen on specific IPv6 addresses, set this
+# to "enable" and specify said addresses below.
+server.use-ipv6 = "disable"
+
+ssl.pemfile = "/etc/lighttpd/cert+privkey.pem"
+ssl.ca-file = "/etc/lighttpd/fullchain.pem"
+
+# redirect HTTP traffic to HTTPS, same for IPv6 below
+$SERVER["socket"] == "0.0.0.0:80" {
+    url.redirect = (
+        "" =&gt; "https://${url.authority.noport}${url.path}${qsa}"
+    )
+}
+$SERVER["socket"] == "0.0.0.0:443" { ssl.engine = "enable" }
+$SERVER["socket"] == "0.0.0.0:8448" { ssl.engine = "enable" }
+$SERVER["socket"] == "[::]:80" {
+    url.redirect = (
+        "" =&gt; "https://${url.authority.noport}${url.path}${qsa}"
+    )
+}
+$SERVER["socket"] == "[::]:443" { ssl.engine = "enable" }
+$SERVER["socket"] == "[::]:8448" {  ssl.engine = "enable" }
+
+
+
+# both lighttpd and synapse need permissions for socket r/w
+$HTTP["url"] =~ "(/_matrix|_synapse/admin|/_synapse/client)" {
+    proxy.balance = "hash"
+    proxy.server = ( 
+        "" =&gt; ( 
+            "backend-socket" =&gt; (
+                "host" =&gt; "/var/lib/synapse/main_public.sock",
+                "port" =&gt; 0
+            )
+        )
+    )
+    proxy.forwarded = (
+        "for" =&gt; 1,
+        "proto" =&gt; 1,
+        "host" =&gt; 1,
+    )
+}
+# protect admin access IPv6 ULA only
+$HTTP["remoteip"] !="fd00::/8" {
+    $HTTP["url"] =~ "^/_synapse/admin/" {
+        url.access-deny = ( "" )
+    }
+}
+</code></pre>
+<p><a href="#delegation-of-incoming-federation-traffic">Delegation</a> example:</p>
+<pre><code class="language-conf">url.rewrite-once = (
+    "^/\.well-known/matrix/client$" =&gt; "/.well-known/matrix/client.json",
+    "^/\.well-known/matrix/server$" =&gt; "/.well-known/matrix/server.json"
+)
+
+# This condition intentionally matches the post-rewrite URLs.
+$HTTP["url"] =~ "^/\.well-known/matrix/(client|server)\.json$" {
+    mimetype.assign = ( ".json" =&gt; "application/json" )
+    setenv.set-response-header = ( "Access-Control-Allow-Origin" =&gt; "*" )
 }
 </code></pre>
 <h2 id="health-check-endpoint"><a class="header" href="#health-check-endpoint">Health check endpoint</a></h2>
@@ -2014,6 +2094,34 @@ database migrations are complete. You should wait until background updates from
 each upgrade are complete before moving on to the next upgrade, to avoid
 stacking them up. You can monitor the currently running background updates with
 <a href="#status">the Admin API</a>.</p>
+<h1 id="upgrading-to-v11610"><a class="header" href="#upgrading-to-v11610">Upgrading to v1.161.0</a></h1>
+<h2 id="deprecation-of-matrix_rtclivekit_service_url"><a class="header" href="#deprecation-of-matrix_rtclivekit_service_url">Deprecation of <code>matrix_rtc.livekit_service_url</code></a></h2>
+<p>When configuring the MatrixRTC LiveKit transport, the <code>livekit_service_url</code> is now
+deprecated but should continue to be listed to ensure backwards compatibility with
+older clients. A new sibling <code>url</code> config property is added that should be set to
+your SFU’s WebSocket URL. Clients that support <code>url</code> will use the Client-Server API
+to (indirectly) interact with the LiveKit authorization service. The service needs
+to be set up as an application service in order to support these endpoints. See
+https://github.com/element-hq/lk-jwt-service and
+https://element-hq.github.io/synapse/v1.161/usage/configuration/config_documentation.html#matrix_rtc
+for further details.</p>
+<h1 id="upgrading-to-v11590"><a class="header" href="#upgrading-to-v11590">Upgrading to v1.159.0</a></h1>
+<h2 id="change-of-signing-key-expiry-date-for-the-debianubuntu-package-repository-2026"><a class="header" href="#change-of-signing-key-expiry-date-for-the-debianubuntu-package-repository-2026">Change of signing key expiry date for the Debian/Ubuntu package repository (2026)</a></h2>
+<p>Administrators using the Debian/Ubuntu packages from <code>packages.matrix.org</code>,
+please be aware that we have recently updated the expiry date on the repository’s GPG signing key,
+but this change must be imported into your keyring.</p>
+<p>If you have the <code>matrix-org-archive-keyring</code> package installed and it updates before the current key expires, this should
+happen automatically.</p>
+<p>Otherwise, if you see an error similar to <code>The following signatures were invalid: EXPKEYSIG F473DD4473365DE1</code>, you
+will need to get a fresh copy of the keys. You can do so with:</p>
+<pre><code class="language-sh">sudo wget -O /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
+</code></pre>
+<p>The old version of the key will expire on <code>2027-03-15</code>.</p>
+<h1 id="upgrading-to-v11580"><a class="header" href="#upgrading-to-v11580">Upgrading to v1.158.0</a></h1>
+<h2 id="drop-support-for-ubuntu-2510-questing-quokka-add-support-for-ubuntu-2604-resolute-raccoon"><a class="header" href="#drop-support-for-ubuntu-2510-questing-quokka-add-support-for-ubuntu-2604-resolute-raccoon">Drop support for Ubuntu 25.10 ‘Questing Quokka’, add support for Ubuntu 26.04 ‘Resolute Raccoon’</a></h2>
+<p>Ubuntu 25.10 ‘Questing Quokka’ <a href="https://endoflife.date/ubuntu">is end-of-life as of
+2026-07-01</a>. This release drops support for Ubuntu 25.10,
+and in its place adds support for Ubuntu 26.04 ‘Resolute Raccoon’.</p>
 <h1 id="upgrading-to-v11570"><a class="header" href="#upgrading-to-v11570">Upgrading to v1.157.0</a></h1>
 <h2 id="msc3861-auth-delegation-must-be-migrated-to-stable-matrix-authentication-service-integration"><a class="header" href="#msc3861-auth-delegation-must-be-migrated-to-stable-matrix-authentication-service-integration">MSC3861 Auth Delegation must be migrated to stable Matrix Authentication Service integration</a></h2>
 <p>Support for the deprecated MSC3861 Auth Delegation (<code>experimental_features.msc3861</code>)
@@ -4438,6 +4546,14 @@ shown.</p>
 <pre><code class="language-yaml">include_profile_data_on_invite: false
 </code></pre>
 <hr>
+<h3 id="include_profile_updates_in_sync"><a class="header" href="#include_profile_updates_in_sync"><code>include_profile_updates_in_sync</code></a></h3>
+<p><em>(boolean)</em> Use this option to include updates of other users’ profiles in sync responses, for users who share rooms.
+For legacy sync clients, requires <a href="https://github.com/matrix-org/matrix-spec-proposals/pull/4429">MSC4429</a> compatibility. For sliding sync clients, requires <a href="https://github.com/matrix-org/matrix-spec-proposals/pull/4262">MSC4262</a> compatibility. Note, profile updates via sync are currently limited to local users only.
+This feature is under development and should be used with caution on busy servers or servers which depend on <code>limit_profile_requests_to_users_who_share_rooms</code> for ensuring profile information doesn’t leak across rooms. Defaults to <code>false</code>.</p>
+<p>Example configuration:</p>
+<pre><code class="language-yaml">include_profile_updates_in_sync: true
+</code></pre>
+<hr>
 <h3 id="allow_public_rooms_without_auth"><a class="header" href="#allow_public_rooms_without_auth"><code>allow_public_rooms_without_auth</code></a></h3>
 <p><em>(boolean)</em> If set to true, removes the need for authentication to access the server’s public rooms directory through the client API, meaning that anyone can query the room directory. Defaults to <code>false</code>.</p>
 <p>Example configuration:</p>
@@ -5242,9 +5358,11 @@ For more details, see the <a href="#using-a-forward-proxy-with-synapse">forward 
 <p>Options related to federation.</p>
 <hr>
 <h3 id="federation_domain_whitelist"><a class="header" href="#federation_domain_whitelist"><code>federation_domain_whitelist</code></a></h3>
-<p><em>(array)</em> Restrict federation to the given whitelist of domains. N.B. we recommend also firewalling your federation listener to limit inbound federation traffic as early as possible, rather than relying purely on this application-layer restriction. If not specified, the default is to whitelist everything.</p>
+<p><em>(null|array)</em> Restrict federation to the given whitelist of domains. N.B. we recommend also firewalling your federation listener to limit inbound federation traffic as early as possible, rather than relying purely on this application-layer restriction.</p>
+<p>If specified as an empty list (<code>[]</code>), federation will be denied with all servers. Specifying an empty list (<code>[]</code>) here is the recommended way of disabling federation.</p>
+<p>If unset or null, allows federation with all servers.</p>
 <p>Note: this does not stop a server from joining rooms that servers not on the whitelist are in. As such, this option is really only useful to establish a “private federation”, where a group of servers all whitelist each other and have the same whitelist.</p>
-<p>Defaults to <code>[]</code>.</p>
+<p>Defaults to <code>null</code>.</p>
 <p>Example configuration:</p>
 <pre><code class="language-yaml">federation_domain_whitelist:
 - lon.example.com
@@ -6452,7 +6570,12 @@ These limits are applied in addition to the <code>max_upload_size</code> limit a
 <p><code>type</code> (string): The type of transport to use to connect to the selective forwarding unit (SFU).</p>
 </li>
 <li>
-<p><code>livekit_service_url</code> (string): The base URL of the LiveKit service. Should only be used with LiveKit-based transports.</p>
+<p><code>url</code> (string): The WebSocket URL of the LiveKit SFU. If type is “livekit”, either this or <code>livekit_service_url</code> is required.</p>
+<p>Clients that support <code>url</code> will use the Client-Server API to (indirectly) interact with the LiveKit authorization service. The service needs to be set up as an application service in order to support these endpoints. See https://github.com/element-hq/lk-jwt-service for further details.</p>
+</li>
+<li>
+<p><code>livekit_service_url</code> (string): Deprecated. The HTTP URL of the LiveKit authorization service. If type is “livekit”, either this or <code>url</code> is required.</p>
+<p>Clients that don’t support <code>url</code> will use <code>livekit_service_url</code> to directly interact with the LiveKit authorization service. This mode of operation is deprecated and should only be used for backwards compatibility.</p>
 </li>
 </ul>
 </li>
@@ -6461,6 +6584,7 @@ These limits are applied in addition to the <code>max_upload_size</code> limit a
 <pre><code class="language-yaml">matrix_rtc:
   transports:
   - type: livekit
+    url: wss://livekit.example.com
     livekit_service_url: https://matrix-rtc.example.com/livekit/jwt
 </code></pre>
 <hr>
@@ -12220,9 +12344,6 @@ may change without notice.
 </span></strong></p>
 <p>Called when a user attempts to upload media that would exceed a
 <a href="#media_upload_limits">configured media upload limit</a>.</p>
-<p>This callback will only be called on workers which handle
-<a href="https://spec.matrix.org/v1.15/client-server-api/#post_matrixmediav3upload">POST /_matrix/media/v3/upload</a>
-requests.</p>
 <p>This could be used to inform the user that they have reached a media upload limit through
 some external method.</p>
 <p>The arguments passed to this callback are:</p>
@@ -12803,9 +12924,14 @@ configured as stream writer for the <code>device_lists</code> stream:</p>
 </code></pre>
 <h5 id="the-quarantined_media_changes-stream"><a class="header" href="#the-quarantined_media_changes-stream">The <code>quarantined_media_changes</code> stream</a></h5>
 <p>The <code>quarantined_media_changes</code> stream supports multiple writers. The following endpoints
-can be handled by any worker, but should be routed directly to one of the workers
-configured as stream writer for the <code>quarantined_media_changes</code> stream:</p>
+must be routed directly to one of the workers configured as stream writer for the
+<code>quarantined_media_changes</code> stream (which must also be able to run the media
+repository, as these endpoints are only registered on media-capable workers):</p>
 <pre><code>^/_synapse/admin/v1/quarantine_media/.*$
+^/_synapse/admin/v1/room/.*/media/quarantine$
+^/_synapse/admin/v1/user/.*/media/quarantine$
+^/_synapse/admin/v1/media/quarantine/.*$
+^/_synapse/admin/v1/media/unquarantine/.*$
 </code></pre>
 <h4 id="restrict-outbound-federation-traffic-to-a-specific-set-of-workers"><a class="header" href="#restrict-outbound-federation-traffic-to-a-specific-set-of-workers">Restrict outbound federation traffic to a specific set of workers</a></h4>
 <p>The
@@ -15431,13 +15557,15 @@ for a server admin: see <a href="usage/administration/admin_api">Admin API</a>.<
 <p><strong>Query parameters:</strong></p>
 <ul>
 <li>
-<p><code>action_name</code>: string - Is optional. Returns only the scheduled tasks with the given action name.</p>
+<p><code>action_name</code>: string - Is optional. Returns only the scheduled tasks with the given action name.
+May be given multiple times to return tasks matching any of the given action names.</p>
 </li>
 <li>
 <p><code>resource_id</code>: string - Is optional. Returns only the scheduled tasks with the given resource id.</p>
 </li>
 <li>
-<p><code>status</code>: string - Is optional. Returns only the scheduled tasks matching the given status, one of</p>
+<p><code>status</code>: string - Is optional. Returns only the scheduled tasks matching the given status.
+May be given multiple times to return tasks matching any of the given statuses. The status must be one of</p>
 <ul>
 <li>“scheduled” - Task is scheduled but not active</li>
 <li>“active” - Task is active and probably running, and if not will be run on next scheduler loop run</li>
@@ -18914,13 +19042,10 @@ reference only.</p>
 <h3 id="building-full-schema-dumps"><a class="header" href="#building-full-schema-dumps">Building full schema dumps</a></h3>
 <p>If you want to recreate these schemas, they need to be made from a database that
 has had all background updates run.</p>
-<p>To do so, use <code>scripts-dev/make_full_schema.sh</code>. This will produce new
-<code>full.sql.postgres</code> and <code>full.sql.sqlite</code> files.</p>
-<p>Ensure postgres is installed, then run:</p>
-<pre><code class="language-sh">./scripts-dev/make_full_schema.sh -p postgres_username -o output_dir/
-</code></pre>
-<p>NB at the time of writing, this script predates the split into separate <code>state</code>/<code>main</code>
-databases so will require updates to handle that correctly.</p>
+<p>To do so, use the <code>make_full_schema.sh</code> script. This will produce new
+<code>full.sql.postgres</code> and <code>full.sql.sqlite</code> files, after having applied ALL
+schema deltas and background updates.</p>
+<p>Run <code>poetry run scripts-dev/make_full_schema.sh -h</code> for usage instructions.</p>
 <h2 id="delta-files"><a class="header" href="#delta-files">Delta files</a></h2>
 <p>Delta files define the steps required to upgrade the database from an earlier version.
 They can be written as either a file containing a series of SQL statements, or a Python
@@ -20448,11 +20573,12 @@ necessary registration and event handling.</p>
 <ul>
 <li>will need an <a href="https://github.com/element-hq/synapse/blob/4367fb2d078c52959aeca0fe6874539c53e8360d/synapse/storage/databases/main/thread_subscriptions.py#L75">ID generator</a>
 <ul>
-<li>may need <a href="https://github.com/element-hq/synapse/blob/4367fb2d078c52959aeca0fe6874539c53e8360d/synapse/config/workers.py#L177">writer configuration</a>, if there isn’t already an obvious source of configuration for which workers should be designated as writers to your new stream.
+<li>may need <a href="https://github.com/element-hq/synapse/blob/62a4bc46203880dd5034483b0e84156d03a3a8c6/synapse/config/workers.py#L184-L187">writer configuration</a>, if there isn’t already an obvious source of configuration for which workers should be designated as writers to your new stream.
 <ul>
 <li>if adding new writer configuration, add Docker-worker configuration, which lets us configure the writer worker in Complement tests: <a href="https://github.com/element-hq/synapse/blob/4367fb2d078c52959aeca0fe6874539c53e8360d/docker/configure_workers_and_start.py#L331">[1]</a>, <a href="https://github.com/element-hq/synapse/blob/4367fb2d078c52959aeca0fe6874539c53e8360d/docker/configure_workers_and_start.py#L440">[2]</a></li>
 </ul>
 </li>
+<li>Ensure that it’s been correctly added to <code>synapse/replication/tcp/handler.py</code> and it’s <code>streams_to_replicate</code> attribute to ensure that changes are actually replicated.</li>
 </ul>
 </li>
 </ul>
