@@ -45,9 +45,9 @@ if [[ ! -e .env  ]]; then
         mv ${DOMAIN}+1.pem data/ssl/fullchain.pem
         mv ${DOMAIN}+1-key.pem data/ssl/privkey.pem
         cp "$(mkcert -CAROOT)"/rootCA.pem data/ssl/ca-certificates.crt
-        # borrow letsencrypt's SSL config
-        curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf > "data/ssl/options-ssl-nginx.conf"
-        curl -s https://raw.githubusercontent.com/certbot/certbot/master/certbot/certbot/ssl-dhparams.pem > "data/ssl/ssl-dhparams.pem"
+        # borrow letsencrypt's SSL configin
+        curl -fL https://raw.githubusercontent.com/certbot/certbot/main/certbot/src/certbot/_internal/plugins/nginx/tls_configs/options-ssl-nginx.conf -o "data/ssl/options-ssl-nginx.conf"
+        curl -fL https://raw.githubusercontent.com/certbot/certbot/main/certbot/src/certbot/ssl-dhparams.pem -o "data/ssl/ssl-dhparams.pem"
         success=true
     else
         read -p "Use letsencrypt for SSL? [y/n] " use_letsencrypt
@@ -61,9 +61,9 @@ if [[ ! -e .env  ]]; then
         fi
     fi
 else
-    echo ".env already exists; move it out of the way first to re-setup"
+    echo "`.env` already exists; move it out of the way first to re-setup"
 fi
 
 if ! [ -z "$success" ]; then
-    echo ".env and SSL configured; you can now docker compose up"
+    echo "`.env` and SSL configured; you can now `docker compose up`"
 fi

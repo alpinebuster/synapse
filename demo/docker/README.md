@@ -39,7 +39,7 @@ For production-grade Matrix from Element, please see https://element.io/server-s
 Then:
 
 ```sh
-# `openssl dhparam -out data/ssl/ssl-dhparams.pem 2048`
+# sudo rm -rf ./data secrets/ .env .env.orig
 ./setup.sh
 
 # Point DNS for *.domain at your docker host,
