@@ -99,16 +99,17 @@ rc_message:
   per_second: 2
   burst_count: 15
 
-experimental_features:
-  msc3861: # OIDC
-    enabled: true
-    issuer: https://${DOMAIN}/
-    client_id: ${MAS_CLIENT_ID}
-    client_auth_method: client_secret_basic
-    client_secret: '${SECRETS_MAS_CLIENT_SECRET}'
-    admin_token: '${SECRETS_MAS_MATRIX_SECRET}'
-    account_management_url: "https://${MAS_FQDN}/account"
+matrix_authentication_service: # OIDC
+  enabled: true
+  secret: someverysecuresecret
+  endpoint: https://${DOMAIN}/
+  client_id: ${MAS_CLIENT_ID}
+  client_auth_method: client_secret_basic
+  client_secret: '${SECRETS_MAS_CLIENT_SECRET}'
+  admin_token: '${SECRETS_MAS_MATRIX_SECRET}'
+  account_management_url: "https://${MAS_FQDN}/account"
 
+experimental_features:
   # QR login
   msc4108_enabled: true
 
