@@ -87,7 +87,8 @@ policy:
         - admin
 
 account:
-  password_registration_enabled: false
+  password_registration_enabled: true
+  password_registration_email_required: false
 
 branding:
   service_name: null
