@@ -1,7 +1,5 @@
 **Element Synapse - Matrix homeserver implementation**
 
-|support| |development| |documentation| |license| |pypi| |python|
-
 Synapse is an open source `Matrix <https://matrix.org>`__ homeserver
 implementation.
 Matrix is the open standard for secure and
